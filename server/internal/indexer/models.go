@@ -100,6 +100,7 @@ func indexModels(c *Catalog, root string) {
 				if !ok {
 					continue
 				}
+				c.Structs[ts.Name.Name] = structInfo(ts.Name.Name, st)
 				tname, has := tableOf[ts.Name.Name]
 				if !has {
 					continue // not a table model (e.g. *Row scan structs are handled below)
@@ -231,3 +232,32 @@ func Snake(s string) string {
 	return b.String()
 }
 
+func structInfo(name string, st *ast.StructType) *StructInfo {
+	si := &StructInfo{Name: name}
+	for _, f := range st.Fields.List {
+		tag := reflect.StructTag("")
+		if f.Tag != nil {
+			if u, err := strconv.Unquote(f.Tag.Value); err == nil {
+				tag = reflect.StructTag(u)
+			}
+		}
+		if tag.Get("db") == "-" {
+			continue
+		}
+		for _, n := range f.Names {
+			if !n.IsExported() {
+				continue
+			}
+			col := strings.Split(tag.Get("db"), ",")[0]
+			if col == "" {
+				col = Snake(n.Name)
+			}
+			alts := []string{strings.ToLower(n.Name), Snake(n.Name)}
+			if j := strings.Split(tag.Get("json"), ",")[0]; j != "" && j != "-" {
+				alts = append(alts, j)
+			}
+			si.Fields = append(si.Fields, StructField{Col: col, Alt: alts, GoName: n.Name, GoType: exprString(f.Type)})
+		}
+	}
+	return si
+}

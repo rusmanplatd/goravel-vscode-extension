@@ -143,6 +143,7 @@ func (s *Server) dispatch(m *message) {
 				"completionProvider": map[string]any{"triggerCharacters": []string{".", " "}},
 				"hoverProvider":      true,
 				"definitionProvider": true,
+				"codeActionProvider": true,
 			},
 			"serverInfo": map[string]any{"name": "goravel-lsp", "version": "0.1.0"},
 		})
@@ -201,6 +202,8 @@ func (s *Server) dispatch(m *message) {
 		s.reply(m.ID, s.completion(m.Params))
 	case "textDocument/hover":
 		s.reply(m.ID, s.hover(m.Params))
+	case "textDocument/codeAction":
+		s.reply(m.ID, s.codeAction(m.Params))
 	case "textDocument/definition":
 		s.reply(m.ID, s.definition(m.Params))
 	default:
@@ -396,22 +399,47 @@ func (s *Server) diagnose(uri string) {
 	diags := []map[string]any{}
 	if strings.HasSuffix(uri, ".go") {
 		fi := rawsql.Extract(uriToPath(uri), []byte(text), s.cat)
-		for _, d := range fi.Docs {
-			sc := fi.BuildScope(d, s.cat)
-			for _, is := range d.Check(sc) {
-				g1, ok1 := d.ToGo(is.VStart)
-				g2, ok2 := d.ToGo(is.VEnd)
-				if !ok1 || !ok2 {
-					continue
-				}
-				diags = append(diags, map[string]any{
-					"range":    Range{offsetToPos(text, g1), offsetToPos(text, g2)},
-					"severity": 1, "source": "goravel-sql", "message": is.Message,
-				})
-			}
+		for _, d := range rawsql.Analyze(fi, s.cat) {
+			diags = append(diags, map[string]any{
+				"range":    Range{offsetToPos(text, d.Start), offsetToPos(text, d.End)},
+				"severity": d.Severity, "source": "goravel-sql", "message": d.Message,
+			})
 		}
 	}
 	s.notify("textDocument/publishDiagnostics", map[string]any{"uri": uri, "diagnostics": diags})
+}
+
+func (s *Server) codeAction(raw json.RawMessage) any {
+	var p struct {
+		TextDocument struct {
+			URI string `json:"uri"`
+		} `json:"textDocument"`
+		Range Range `json:"range"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	uri := p.TextDocument.URI
+	text, ok := s.docs[uri]
+	if !ok || !strings.HasSuffix(uri, ".go") {
+		return nil
+	}
+	off := posToOffset(text, p.Range.Start)
+	fi := rawsql.Extract(uriToPath(uri), []byte(text), s.cat)
+	actions := []map[string]any{}
+	edit := func(title, kind string, start, end int, newText string) {
+		actions = append(actions, map[string]any{
+			"title": title, "kind": kind,
+			"edit": map[string]any{"changes": map[string]any{uri: []map[string]any{{
+				"range": Range{offsetToPos(text, start), offsetToPos(text, end)}, "newText": newText,
+			}}}},
+		})
+	}
+	if st, en, repl, ok := rawsql.ExpandStar(fi, s.cat, off); ok {
+		edit("Expand * to explicit columns", "refactor.rewrite", st, en, repl)
+	}
+	if at, code, name, ok := rawsql.GenerateRowStruct(fi, s.cat, off); ok {
+		edit("Generate row struct "+name, "refactor.extract", at, at, code)
+	}
+	return actions
 }
 
 // ---- position helpers (LSP uses UTF-16 columns) ----
@@ -459,4 +487,3 @@ func uriToPath(uri string) string {
 func pathToURI(p string) string {
 	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(p)}).String()
 }
-

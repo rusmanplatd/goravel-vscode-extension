@@ -66,10 +66,40 @@ type Catalog struct {
 	mu     sync.RWMutex
 	Tables map[string]*Table // by table name (no schema)
 	Models map[string]*Table // by Go model name
+	// Structs holds every struct in app/models (including *Row scan structs).
+	Structs map[string]*StructInfo
+}
+
+// StructField is a Go struct field with the DB column it scans from.
+type StructField struct {
+	Col    string
+	Alt    []string // other accepted column names (json tag, snake_case)
+	GoName string
+	GoType string
+}
+
+// StructInfo describes a Go struct in app/models.
+type StructInfo struct {
+	Name   string
+	Fields []StructField
+}
+
+func (s *StructInfo) Has(col string) *StructField {
+	for i := range s.Fields {
+		if strings.EqualFold(s.Fields[i].Col, col) {
+			return &s.Fields[i]
+		}
+		for _, a := range s.Fields[i].Alt {
+			if strings.EqualFold(a, col) {
+				return &s.Fields[i]
+			}
+		}
+	}
+	return nil
 }
 
 func NewCatalog() *Catalog {
-	return &Catalog{Tables: map[string]*Table{}, Models: map[string]*Table{}}
+	return &Catalog{Tables: map[string]*Table{}, Models: map[string]*Table{}, Structs: map[string]*StructInfo{}}
 }
 
 // StripSchema turns `geo_app.ref_geo_cities` into `ref_geo_cities`.
@@ -91,6 +121,12 @@ func (c *Catalog) Model(name string) *Table {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.Models[name]
+}
+
+func (c *Catalog) Struct(name string) *StructInfo {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.Structs[name]
 }
 
 func (c *Catalog) TableNames() []string {
@@ -122,4 +158,3 @@ func Build(root string) *Catalog {
 	indexMigrations(c, root)
 	return c
 }
-

@@ -105,4 +105,3 @@ func offsetLoc(path, src string, off int) Location {
 	col := off - (strings.LastIndex(src[:off], "\n") + 1)
 	return Location{File: path, Line: line, Col: col}
 }
-

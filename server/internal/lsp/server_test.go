@@ -153,3 +153,60 @@ func TestNoFalsePositives(t *testing.T) {
 	}
 }
 
+func diagsOf(res []map[string]any) string {
+	var sb strings.Builder
+	for _, r := range res {
+		if r["method"] == "textDocument/publishDiagnostics" {
+			b, _ := json.Marshal(r["params"])
+			sb.Write(b)
+		}
+	}
+	return sb.String()
+}
+
+func TestScanMismatchDiagnostic(t *testing.T) {
+	root, uri, text := fixture(t)
+	bad := strings.Replace(text, "SELECT id, province_id, name, code,", "SELECT id, province_id, name, code, deleted_by_id,", 1)
+	res := run(t, init1(root), open(uri, bad), map[string]any{"method": "exit"})
+	if d := diagsOf(res); !strings.Contains(d, "Column 'deleted_by_id' has no matching field in CityRow") {
+		t.Errorf("expected scan mismatch, got %s", d)
+	}
+}
+
+func TestPlaceholderCountDiagnostic(t *testing.T) {
+	root, uri, text := fixture(t)
+	bad := strings.Replace(text, "WHERE id = $1 AND deleted_at IS NULL", "WHERE id = $1 AND name = $2 AND deleted_at IS NULL", 1)
+	res := run(t, init1(root), open(uri, bad), map[string]any{"method": "exit"})
+	if d := diagsOf(res); !strings.Contains(d, "Query has 2 placeholder(s) but 1 argument(s) passed") {
+		t.Errorf("expected placeholder diagnostic, got %s", d)
+	}
+}
+
+func codeActions(t *testing.T, root, uri, text string, pos map[string]any) string {
+	res := run(t, init1(root), open(uri, text),
+		map[string]any{"id": 2, "method": "textDocument/codeAction", "params": map[string]any{
+			"textDocument": map[string]any{"uri": uri}, "range": map[string]any{"start": pos, "end": pos},
+			"context": map[string]any{"diagnostics": []any{}}}},
+		map[string]any{"method": "exit"})
+	b, _ := json.Marshal(find(res, 2)["result"])
+	return string(b)
+}
+
+func TestExpandStarAction(t *testing.T) {
+	root, uri, text := fixture(t)
+	star := strings.Replace(text, "SELECT ct.id, ct.province_id,", "SELECT ct.*, ct.province_id,", 1)
+	got := codeActions(t, root, uri, star, posAfter(star, "SELECT ct.*", 0))
+	if !strings.Contains(got, "Expand * to explicit columns") || !strings.Contains(got, "ct.province_id, ct.name") {
+		t.Errorf("expand action: %s", got)
+	}
+}
+
+func TestGenerateRowStructAction(t *testing.T) {
+	root, uri, text := fixture(t)
+	got := codeActions(t, root, uri, text, posAfter(text, "facades.DB().Select(&row, query", 0))
+	for _, want := range []string{"Generate row struct FindByIDRow", "ProvinceID uuid.UUID", "Code sql.NullString", "Latitude sql.NullFloat64"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("missing %q in %s", want, got)
+		}
+	}
+}

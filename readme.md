@@ -9,7 +9,11 @@ Inside Go strings passed to `facades.DB()` / built with `+` concatenation and `f
 - **Completion**: tables after `FROM`/`JOIN`, columns after `alias.`, columns in scope elsewhere.
 - **Hover**: column → Go field, SQL type, nullability, `@Description`.
 - **Go to definition**: column/table → model field/struct **and** migration `CREATE TABLE` line.
-- **Diagnostics**: unknown `alias.column`.
+- **Diagnostics**: unknown `alias.column`; placeholder count vs. arguments (`$N`/`?`);
+  `Select(&dest, ...)` columns with no matching field in the destination struct; columns that may be NULL
+  scanned into non-nullable fields (info).
+- **Code actions**: expand `*` / `alias.*` to explicit columns; generate a `<Func>Row` struct from a `Select` call
+  (uses `sql.Null*` for nullable / LEFT JOIN columns).
 - **SQL highlighting** in raw strings.
 
 Table variables like `x := (models.RefGeoCity{}).TableName(ctx)` are resolved through the model's
@@ -35,6 +39,6 @@ Press F5 in VS Code (Extension Development Host) and open a Goravel project.
 | 1. Scaffolding, SQL grammar, LSP skeleton | done |
 | 2. Schema indexer (models + migrations) | done (live DB introspection deferred) |
 | 3. Raw SQL: completion, hover, definition, unknown-column diagnostics | done |
-| 3b. Scan-struct mismatch, placeholder count, "Generate Row struct", `SELECT *` expand | todo |
+| 3b. Scan-struct mismatch, placeholder count, "Generate Row struct", `SELECT *` expand | done |
 | 4. ORM string args, Config keys, Routes, Artisan | todo |
 

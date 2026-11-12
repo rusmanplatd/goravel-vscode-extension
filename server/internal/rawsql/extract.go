@@ -25,12 +25,14 @@ type Doc struct {
 	Func    int // offset of enclosing func (or -1)
 	GoStart int
 	GoEnd   int
+	Dynamic bool // contains values only known at runtime (format verbs, unknown vars)
 }
 
 // FileInfo is the extraction result for one Go file.
 type FileInfo struct {
-	Src  []byte
-	Docs []*Doc
+	Src     []byte
+	Docs    []*Doc
+	Queries []*QueryCall
 }
 
 var sqlish = regexp.MustCompile(`(?is)^\s*(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|WITH|CREATE|ALTER|DROP|TRUNCATE|AND|OR|WHERE|ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|OFFSET|LEFT\s+JOIN|INNER\s+JOIN|RIGHT\s+JOIN|JOIN|SET|FROM|ON)\s`)
@@ -94,11 +96,11 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 		return true
 	})
 
-	build := func(e ast.Expr, fn int) *Doc {
+	build := func(e ast.Expr, fn int, env map[string][]ast.Expr) *Doc {
 		d := &Doc{Func: fn, GoStart: off(e.Pos()), GoEnd: off(e.End())}
 		var sb strings.Builder
-		var flat func(e ast.Expr)
-		flat = func(e ast.Expr) {
+		var flat func(e ast.Expr, depth int)
+		flat = func(e ast.Expr, depth int) {
 			switch x := e.(type) {
 			case *ast.BasicLit:
 				if x.Kind != token.STRING {
@@ -111,35 +113,47 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 					return
 				}
 				raw := string(src[start:end])
+				if strings.Contains(raw, "%") {
+					d.Dynamic = true
+				}
 				vs := sb.Len()
 				sb.WriteString(neutralize(raw))
 				d.Segs = append(d.Segs, Seg{vs, sb.Len(), start})
 			case *ast.ParenExpr:
-				flat(x.X)
+				flat(x.X, depth)
 			case *ast.BinaryExpr:
 				if x.Op == token.ADD {
-					flat(x.X)
-					flat(x.Y)
+					flat(x.X, depth)
+					flat(x.Y, depth)
 				} else {
+					d.Dynamic = true
 					sb.WriteString("__")
 				}
 			case *ast.Ident:
 				if t, ok := vars[x.Name]; ok {
 					sb.WriteString(t)
+				} else if exprs := env[x.Name]; len(exprs) > 0 && depth < 8 {
+					for _, ex := range exprs {
+						flat(ex, depth+1)
+					}
 				} else {
+					d.Dynamic = true
 					sb.WriteString("__" + x.Name + "__")
 				}
 			case *ast.CallExpr:
 				if isSprintf(x) && len(x.Args) > 0 {
-					flat(x.Args[0])
+					d.Dynamic = true
+					flat(x.Args[0], depth)
 				} else {
+					d.Dynamic = true
 					sb.WriteString("__call__")
 				}
 			default:
+				d.Dynamic = true
 				sb.WriteString("__")
 			}
 		}
-		flat(e)
+		flat(e, 0)
 		d.Text = sb.String()
 		return d
 	}
@@ -151,20 +165,20 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 				if x.Op != token.ADD {
 					return true
 				}
-				if d := build(x, fn); len(d.Segs) > 0 && anySQL(d, src) {
+				if d := build(x, fn, nil); len(d.Segs) > 0 && anySQL(d, src) {
 					fi.Docs = append(fi.Docs, d)
 					return false
 				}
 			case *ast.CallExpr:
 				if isSprintf(x) && len(x.Args) > 0 {
-					if d := build(x, fn); len(d.Segs) > 0 && sqlish.MatchString(d.Text) {
+					if d := build(x, fn, nil); len(d.Segs) > 0 && sqlish.MatchString(d.Text) {
 						fi.Docs = append(fi.Docs, d)
 						return false
 					}
 				}
 			case *ast.BasicLit:
 				if x.Kind == token.STRING {
-					if d := build(x, fn); sqlish.MatchString(d.Text) {
+					if d := build(x, fn, nil); sqlish.MatchString(d.Text) {
 						fi.Docs = append(fi.Docs, d)
 					}
 				}
@@ -175,6 +189,7 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 	for _, decl := range f.Decls {
 		if fd, ok := decl.(*ast.FuncDecl); ok && fd.Body != nil {
 			handle(fd.Body, off(fd.Pos()))
+			analyzeQueries(fi, fd, cat, off, build)
 		} else {
 			handle(decl, -1)
 		}
@@ -212,7 +227,7 @@ func neutralize(s string) string {
 			b[i] = ' '
 			i++
 		case b[i] == '%' && (b[i+1] == 'd' || b[i+1] == 's' || b[i+1] == 'v'):
-			b[i], b[i+1] = '1', ' '
+			b[i], b[i+1] = '_', '_'
 			i++
 		}
 	}
@@ -254,4 +269,3 @@ func (fi *FileInfo) DocAt(goOff int) *Doc {
 	}
 	return best
 }
-

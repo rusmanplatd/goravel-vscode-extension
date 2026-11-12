@@ -32,14 +32,10 @@ func Check(root string) int {
 		}
 		fi := rawsql.Extract(p, b, cat)
 		docs += len(fi.Docs)
-		for _, doc := range fi.Docs {
-			for _, is := range doc.Check(fi.BuildScope(doc, cat)) {
-				if g, ok := doc.ToGo(is.VStart); ok {
-					pos := offsetToPos(string(b), g)
-					fmt.Printf("%s:%d:%d: %s\n", p, pos.Line+1, pos.Character+1, is.Message)
-					issues++
-				}
-			}
+		for _, dg := range rawsql.Analyze(fi, cat) {
+			pos := offsetToPos(string(b), dg.Start)
+			fmt.Printf("%s:%d:%d: %s\n", p, pos.Line+1, pos.Character+1, dg.Message)
+			issues++
 		}
 		return nil
 	})
