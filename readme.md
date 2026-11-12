@@ -33,6 +33,26 @@ npm run test:server    # go tests
 
 Press F5 in VS Code (Extension Development Host) and open a Goravel project.
 
+## Package & Publish
+
+```bash
+npm run package        # builds and creates goravel-vscode-<version>.vsix
+npx vsce login rusmanplatd   # authenticate once with an Azure DevOps PAT (Marketplace: Manage)
+npm run publish        # builds and publishes current version to VS Code Marketplace
+npm run publish:patch  # bumps patch version, builds, and publishes
+npm run publish:minor  # bumps minor version, builds, and publishes
+npm run publish:major  # bumps major version, builds, and publishes
+```
+
+### Auto-publish via GitHub Actions
+
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml) runs typecheck, Go tests, packages the `.vsix`, and publishes to the VS Code Marketplace using **Trusted Publishing (OIDC)** on `v*` tag pushes or manual `workflow_dispatch` (no `VSCE_PAT` secret required).
+
+Push a version tag to release:
+```bash
+git tag v0.1.0 && git push origin v0.1.0
+```
+
 ## Roadmap status
 
 | Milestone | Status |

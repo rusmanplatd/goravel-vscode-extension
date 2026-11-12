@@ -4,10 +4,23 @@
   "description": "Goravel tooling: raw SQL language server (completion, hover, go-to-definition, diagnostics) for Go projects",
   "version": "0.1.0",
   "publisher": "rusmanplatd",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/rusmanplatd/goravel-vscode-extension.git"
+  },
   "license": "MIT",
-  "engines": { "vscode": "^1.85.0" },
-  "categories": ["Programming Languages", "Linters", "Other"],
-  "activationEvents": ["workspaceContains:artisan", "workspaceContains:app/models"],
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:artisan",
+    "workspaceContains:app/models"
+  ],
   "main": "./dist/extension.js",
   "contributes": {
     "configuration": {
@@ -26,14 +39,21 @@
       }
     },
     "commands": [
-      { "command": "goravel.restartServer", "title": "Goravel: Restart Language Server" }
+      {
+        "command": "goravel.restartServer",
+        "title": "Goravel: Restart Language Server"
+      }
     ],
     "grammars": [
       {
         "scopeName": "goravel-sql.injection",
         "path": "./syntaxes/goravel-sql.injection.tmLanguage.json",
-        "injectTo": ["source.go"],
-        "embeddedLanguages": { "meta.embedded.block.sql": "sql" }
+        "injectTo": [
+          "source.go"
+        ],
+        "embeddedLanguages": {
+          "meta.embedded.block.sql": "sql"
+        }
       }
     ]
   },
@@ -44,12 +64,17 @@
     "build": "npm run build:server && npm run build:client",
     "test:server": "cd server && go test ./...",
     "typecheck": "tsc --noEmit -p .",
-    "package": "vsce package"
+    "vscode:prepublish": "npm run build",
+    "package": "vsce package",
+    "publish": "vsce publish",
+    "publish:patch": "vsce publish patch",
+    "publish:minor": "vsce publish minor",
+    "publish:major": "vsce publish major"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
-    "@vscode/vsce": "^3.0.0",
+    "@vscode/vsce": "^4.0.0",
     "esbuild": "^0.24.0",
     "typescript": "^5.5.0"
   },
