@@ -25,6 +25,7 @@ The schema is indexed statically from `app/models/*.go` and `database/migrations
 ```bash
 npm install
 npm run build          # builds bin/goravel-lsp and dist/extension.js
+npm run install:server # installs goravel-lsp to $(go env GOPATH)/bin (or $GOBIN)
 npm run test:server    # go tests
 ./bin/goravel-lsp --check /path/to/goravel-project   # lint all SQL in a project (CLI)
 ./bin/goravel-lsp --dump  /path/to/goravel-project   # list indexed tables

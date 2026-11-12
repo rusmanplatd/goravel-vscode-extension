@@ -39,6 +39,7 @@
   },
   "scripts": {
     "build:server": "cd server && go build -o ../bin/goravel-lsp .",
+    "install:server": "cd server && go install .",
     "build:client": "esbuild client/src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
     "build": "npm run build:server && npm run build:client",
     "test:server": "cd server && go test ./...",
