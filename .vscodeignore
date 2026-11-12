@@ -1,0 +1,6 @@
+server/
+docs/
+client/
+**/*.map
+node_modules/
+tsconfig.json

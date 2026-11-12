@@ -1,0 +1,13 @@
+{
+  "scopeName": "goravel-sql.injection",
+  "injectionSelector": "L:source.go string.quoted.raw.go",
+  "patterns": [{ "include": "#sql" }],
+  "repository": {
+    "sql": {
+      "begin": "(?i)(?=\\s*(?:SELECT|INSERT\\s+INTO|UPDATE|DELETE\\s+FROM|WITH|CREATE\\s+(?:TABLE|INDEX|POLICY|OR\\s+REPLACE)|ALTER\\s+TABLE|DROP\\s+TABLE)\\b)",
+      "end": "(?=`)",
+      "contentName": "meta.embedded.block.sql",
+      "patterns": [{ "include": "source.sql" }]
+    }
+  }
+}

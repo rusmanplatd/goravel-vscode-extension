@@ -1,0 +1,58 @@
+{
+  "name": "goravel-vscode",
+  "displayName": "Goravel",
+  "description": "Goravel tooling: raw SQL language server (completion, hover, go-to-definition, diagnostics) for Go projects",
+  "version": "0.1.0",
+  "publisher": "rusmanplatd",
+  "license": "MIT",
+  "engines": { "vscode": "^1.85.0" },
+  "categories": ["Programming Languages", "Linters", "Other"],
+  "activationEvents": ["workspaceContains:artisan", "workspaceContains:app/models"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "Goravel",
+      "properties": {
+        "goravel.server.path": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the goravel-lsp binary. Defaults to the bundled bin/goravel-lsp."
+        },
+        "goravel.sql.enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable raw SQL intelligence inside Go files."
+        }
+      }
+    },
+    "commands": [
+      { "command": "goravel.restartServer", "title": "Goravel: Restart Language Server" }
+    ],
+    "grammars": [
+      {
+        "scopeName": "goravel-sql.injection",
+        "path": "./syntaxes/goravel-sql.injection.tmLanguage.json",
+        "injectTo": ["source.go"],
+        "embeddedLanguages": { "meta.embedded.block.sql": "sql" }
+      }
+    ]
+  },
+  "scripts": {
+    "build:server": "cd server && go build -o ../bin/goravel-lsp .",
+    "build:client": "esbuild client/src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap",
+    "build": "npm run build:server && npm run build:client",
+    "test:server": "cd server && go test ./...",
+    "typecheck": "tsc --noEmit -p .",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  }
+}
