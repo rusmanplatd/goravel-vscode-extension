@@ -1,8 +1,8 @@
 {
   "name": "goravel-vscode",
   "displayName": "Goravel",
-  "description": "Goravel tooling: raw SQL language server (completion, hover, go-to-definition, diagnostics) for Go projects",
-  "version": "0.1.0",
+  "description": "Goravel tooling: raw SQL LSP, ORM query builder intelligence, Config, Routes, Validation Rules, and Artisan CLI for Go projects",
+  "version": "0.2.0",
   "publisher": "rusmanplatd",
   "repository": {
     "type": "git",
@@ -34,16 +34,96 @@
         "goravel.sql.enable": {
           "type": "boolean",
           "default": true,
-          "description": "Enable raw SQL intelligence inside Go files."
+          "description": "Enable Goravel Raw SQL and Framework intelligence inside Go files."
+        },
+        "goravel.sql.liveIntrospection": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable optional live database schema introspection using .env DB_* settings."
         }
       }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "goravel-explorer",
+          "title": "Goravel",
+          "icon": "$(database)"
+        }
+      ]
+    },
+    "views": {
+      "goravel-explorer": [
+        {
+          "id": "goravel.views.models",
+          "name": "Models & Schema"
+        },
+        {
+          "id": "goravel.views.routes",
+          "name": "Routes"
+        },
+        {
+          "id": "goravel.views.migrations",
+          "name": "Migrations"
+        }
+      ]
     },
     "commands": [
       {
         "command": "goravel.restartServer",
         "title": "Goravel: Restart Language Server"
+      },
+      {
+        "command": "goravel.refreshViews",
+        "title": "Goravel: Refresh Sidebar Views",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "goravel.artisan.run",
+        "title": "Goravel: Run Artisan Command..."
+      },
+      {
+        "command": "goravel.artisan.makeModel",
+        "title": "Goravel: Artisan make:model"
+      },
+      {
+        "command": "goravel.artisan.makeController",
+        "title": "Goravel: Artisan make:controller"
+      },
+      {
+        "command": "goravel.artisan.makeMigration",
+        "title": "Goravel: Artisan make:migration"
+      },
+      {
+        "command": "goravel.artisan.makeRequest",
+        "title": "Goravel: Artisan make:request"
+      },
+      {
+        "command": "goravel.artisan.makeRule",
+        "title": "Goravel: Artisan make:rule"
+      },
+      {
+        "command": "goravel.artisan.makeSeeder",
+        "title": "Goravel: Artisan make:seeder"
+      },
+      {
+        "command": "goravel.artisan.migrate",
+        "title": "Goravel: Artisan migrate"
+      },
+      {
+        "command": "goravel.artisan.migrateRollback",
+        "title": "Goravel: Artisan migrate:rollback"
       }
     ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "goravel.refreshViews",
+          "when": "view =~ /^goravel\\.views\\./",
+          "group": "navigation"
+        }
+      ]
+    },
     "grammars": [
       {
         "scopeName": "goravel-sql.injection",

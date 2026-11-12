@@ -18,7 +18,7 @@ type OutCol struct {
 	VEnd      int
 }
 
-// QueryCall is a facades.DB().Select/Insert/Update/... call with its assembled query.
+// QueryCall is a facades.DB().Select/Insert/Update/... or facades.Orm().Query().Raw/... call.
 type QueryCall struct {
 	Method     string
 	FuncName   string
@@ -35,7 +35,7 @@ type QueryCall struct {
 	ArgsOpaque bool // slices / spread: argument count unknown
 }
 
-var queryMethods = map[string]int{"Select": 1, "Insert": 0, "Update": 0, "Delete": 0, "Statement": 0, "Exec": 0}
+var queryMethods = map[string]int{"Select": 1, "Insert": 0, "Update": 0, "Delete": 0, "Statement": 0, "Exec": 0, "Raw": 0}
 
 func typeString(e ast.Expr) string {
 	switch t := e.(type) {
@@ -105,6 +105,25 @@ func analyzeQueries(fi *FileInfo, fd *ast.FuncDecl, cat *indexer.Catalog, off fu
 		}
 	}
 
+	// Track .Raw(...).Scan(&dest) chains
+	scanDestForRaw := map[*ast.CallExpr]ast.Expr{}
+	ast.Inspect(fd.Body, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) == 0 {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || (sel.Sel.Name != "Scan" && sel.Sel.Name != "Find" && sel.Sel.Name != "First") {
+			return true
+		}
+		if inner, ok := sel.X.(*ast.CallExpr); ok {
+			if isel, ok := inner.Fun.(*ast.SelectorExpr); ok && isel.Sel.Name == "Raw" {
+				scanDestForRaw[inner] = call.Args[0]
+			}
+		}
+		return true
+	})
+
 	fnStart := off(fd.Pos())
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
@@ -119,20 +138,19 @@ func analyzeQueries(fi *FileInfo, fd *ast.FuncDecl, cat *indexer.Catalog, off fu
 		if !ok || len(call.Args) <= qi {
 			return true
 		}
-		recv, ok := sel.X.(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		rs, ok := recv.Fun.(*ast.SelectorExpr)
-		if !ok || rs.Sel.Name != "DB" {
+		if !isDBOrOrmReceiver(sel.X) {
 			return true
 		}
 		doc := build(call.Args[qi], fnStart, env)
 		if len(doc.Segs) == 0 {
 			return true
 		}
+		method := sel.Sel.Name
+		if method == "Raw" {
+			method = "Select"
+		}
 		qc := &QueryCall{
-			Method: sel.Sel.Name, FuncName: fd.Name.Name, FuncStart: fnStart,
+			Method: method, FuncName: fd.Name.Name, FuncStart: fnStart,
 			CallStart: off(call.Pos()), CallEnd: off(call.End()),
 			ArgStart: off(call.Args[qi].Pos()), ArgEnd: off(call.Args[qi].End()),
 			Doc: doc, NArgs: len(call.Args) - qi - 1,
@@ -145,15 +163,23 @@ func analyzeQueries(fi *FileInfo, fd *ast.FuncDecl, cat *indexer.Catalog, off fu
 				qc.ArgsOpaque = true
 			}
 		}
+		var destArg ast.Expr
 		if qi == 1 {
-			if u, ok := call.Args[0].(*ast.UnaryExpr); ok && u.Op == token.AND {
-				if id, ok := u.X.(*ast.Ident); ok {
-					t := strings.TrimLeft(types[id.Name], "[]*")
-					if i := strings.LastIndex(t, "."); i >= 0 {
-						t = t[i+1:]
-					}
-					if cat.Struct(t) != nil {
-						qc.DestStruct = t
+			destArg = call.Args[0]
+		} else if da, ok := scanDestForRaw[call]; ok {
+			destArg = da
+		}
+		if method == "Select" {
+			if destArg != nil {
+				if u, ok := destArg.(*ast.UnaryExpr); ok && u.Op == token.AND {
+					if id, ok := u.X.(*ast.Ident); ok {
+						t := strings.TrimLeft(types[id.Name], "[]*")
+						if i := strings.LastIndex(t, "."); i >= 0 {
+							t = t[i+1:]
+						}
+						if cat.Struct(t) != nil {
+							qc.DestStruct = t
+						}
 					}
 				}
 			}
@@ -162,6 +188,21 @@ func analyzeQueries(fi *FileInfo, fd *ast.FuncDecl, cat *indexer.Catalog, off fu
 		fi.Queries = append(fi.Queries, qc)
 		return true
 	})
+}
+
+func isDBOrOrmReceiver(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	if sel.Sel.Name == "DB" || sel.Sel.Name == "Query" {
+		return true
+	}
+	return isDBOrOrmReceiver(sel.X)
 }
 
 var (

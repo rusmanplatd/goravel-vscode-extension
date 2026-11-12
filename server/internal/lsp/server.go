@@ -1,4 +1,4 @@
-// Package lsp implements a minimal stdio JSON-RPC Language Server.
+// Package lsp implements a stdio JSON-RPC Language Server for Goravel projects.
 package lsp
 
 import (
@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/rusmanplatd/goravel-lsp/internal/indexer"
+	"github.com/rusmanplatd/goravel-lsp/internal/orm"
 	"github.com/rusmanplatd/goravel-lsp/internal/rawsql"
 )
 
@@ -129,8 +130,14 @@ func (s *Server) dispatch(m *message) {
 			Folders []struct {
 				URI string `json:"uri"`
 			} `json:"workspaceFolders"`
+			InitOpts struct {
+				LiveIntrospection bool `json:"liveIntrospection"`
+			} `json:"initializationOptions"`
 		}
 		_ = json.Unmarshal(m.Params, &p)
+		if p.InitOpts.LiveIntrospection {
+			indexer.LiveDBEnabled = true
+		}
 		uri := p.RootURI
 		if uri == "" && len(p.Folders) > 0 {
 			uri = p.Folders[0].URI
@@ -140,12 +147,21 @@ func (s *Server) dispatch(m *message) {
 		s.reply(m.ID, map[string]any{
 			"capabilities": map[string]any{
 				"textDocumentSync":   1,
-				"completionProvider": map[string]any{"triggerCharacters": []string{".", " "}},
+				"completionProvider": map[string]any{"triggerCharacters": []string{".", " ", "\"", "|", ":", ","}},
 				"hoverProvider":      true,
 				"definitionProvider": true,
 				"codeActionProvider": true,
+				"codeLensProvider":   map[string]any{"resolveProvider": false},
+				"inlayHintProvider":  true,
+				"semanticTokensProvider": map[string]any{
+					"legend": map[string]any{
+						"tokenTypes":     rawsql.SemanticTokenTypes,
+						"tokenModifiers": []string{"declaration", "readonly"},
+					},
+					"full": true,
+				},
 			},
-			"serverInfo": map[string]any{"name": "goravel-lsp", "version": "0.1.0"},
+			"serverInfo": map[string]any{"name": "goravel-lsp", "version": "0.2.0"},
 		})
 	case "shutdown":
 		s.reply(m.ID, nil)
@@ -183,11 +199,16 @@ func (s *Server) dispatch(m *message) {
 		}
 		_ = json.Unmarshal(m.Params, &p)
 		path := filepath.ToSlash(uriToPath(p.TextDocument.URI))
-		if strings.Contains(path, "/app/models/") || strings.Contains(path, "/database/migrations") {
+		if shouldReindex(path) {
 			s.reindex()
 			for uri := range s.docs {
 				s.diagnose(uri)
 			}
+		}
+	case "workspace/didChangeWatchedFiles":
+		s.reindex()
+		for uri := range s.docs {
+			s.diagnose(uri)
 		}
 	case "textDocument/didClose":
 		var p struct {
@@ -206,11 +227,31 @@ func (s *Server) dispatch(m *message) {
 		s.reply(m.ID, s.codeAction(m.Params))
 	case "textDocument/definition":
 		s.reply(m.ID, s.definition(m.Params))
+	case "textDocument/codeLens":
+		s.reply(m.ID, s.codeLens(m.Params))
+	case "textDocument/inlayHint":
+		s.reply(m.ID, s.inlayHint(m.Params))
+	case "textDocument/semanticTokens/full":
+		s.reply(m.ID, s.semanticTokens(m.Params))
+	case "goravel/overview":
+		s.reply(m.ID, s.overview())
+	case "goravel/explainQuery":
+		s.reply(m.ID, s.explainQuery(m.Params))
 	default:
 		if len(m.ID) > 0 && m.Method != "" {
 			s.send(map[string]any{"jsonrpc": "2.0", "id": m.ID, "error": &rpcError{-32601, "method not found: " + m.Method}})
 		}
 	}
+}
+
+func shouldReindex(path string) bool {
+	return strings.Contains(path, "/app/models/") ||
+		strings.Contains(path, "/database/migrations") ||
+		strings.Contains(path, "/config/") ||
+		strings.Contains(path, "/routes/") ||
+		strings.Contains(path, "/app/rules/") ||
+		strings.Contains(path, "/app/http/controllers/") ||
+		strings.Contains(path, "/app/http/requests/")
 }
 
 func (s *Server) reindex() {
@@ -226,22 +267,35 @@ type posParams struct {
 	Position Position `json:"position"`
 }
 
-// resolve finds file, doc, scope and virtual offset for a request.
-func (s *Server) resolve(raw json.RawMessage) (text string, p posParams, off int, fi *rawsql.FileInfo, d *rawsql.Doc, v int, sc rawsql.Scope, ok bool) {
+func (s *Server) resolveInput(raw json.RawMessage) (uri, path, text string, p posParams, off int, ok bool) {
 	_ = json.Unmarshal(raw, &p)
-	text, found := s.docs[p.TextDocument.URI]
-	if !found || !strings.HasSuffix(p.TextDocument.URI, ".go") {
+	uri = p.TextDocument.URI
+	text, found := s.docs[uri]
+	if !found || !strings.HasSuffix(uri, ".go") {
 		return
 	}
+	path = uriToPath(uri)
 	off = posToOffset(text, p.Position)
-	fi = rawsql.Extract(uriToPath(p.TextDocument.URI), []byte(text), s.cat)
+	ok = true
+	return
+}
+
+// resolve finds file, doc, scope and virtual offset for a raw SQL request.
+func (s *Server) resolve(raw json.RawMessage) (text string, p posParams, off int, fi *rawsql.FileInfo, d *rawsql.Doc, v int, sc rawsql.Scope, ok bool) {
+	_, path, text, p, off, ok := s.resolveInput(raw)
+	if !ok {
+		return
+	}
+	fi = rawsql.Extract(path, []byte(text), s.cat)
 	d = fi.DocAt(off)
 	if d == nil {
+		ok = false
 		return
 	}
 	var vok bool
 	v, vok = d.ToVirtual(off)
 	if !vok {
+		ok = false
 		return
 	}
 	sc = fi.BuildScope(d, s.cat)
@@ -250,7 +304,18 @@ func (s *Server) resolve(raw json.RawMessage) (text string, p posParams, off int
 }
 
 func (s *Server) completion(raw json.RawMessage) any {
-	_, _, _, _, d, v, sc, ok := s.resolve(raw)
+	_, path, text, _, off, inputOK := s.resolveInput(raw)
+	if !inputOK {
+		return nil
+	}
+	// 1. Check ORM / Config / Validation spans first
+	fa := orm.AnalyzeFile(path, []byte(text), s.cat)
+	if items, ok := fa.Completion(off, s.cat); ok && len(items) > 0 {
+		return map[string]any{"isIncomplete": false, "items": items}
+	}
+
+	// 2. Check Raw SQL documents
+	_, _, _, fi, d, v, sc, ok := s.resolve(raw)
 	if !ok {
 		return nil
 	}
@@ -265,13 +330,42 @@ func (s *Server) completion(raw json.RawMessage) any {
 		for _, c := range t.Columns {
 			items = append(items, colItem(t, c))
 		}
+	case cc.WantJoinOn:
+		jt := s.cat.Table(cc.JoinTable)
+		if jt == nil {
+			jt = sc[cc.JoinAlias]
+		}
+		for _, cond := range rawsql.JoinConditions(jt, cc.JoinAlias, sc) {
+			items = append(items, map[string]any{
+				"label": cond, "kind": 15, "detail": "Foreign Key Join Condition",
+				"sortText": "0_" + cond,
+			})
+		}
+		if jt != nil {
+			for _, c := range jt.Columns {
+				items = append(items, colItem(jt, c))
+			}
+		}
 	case cc.WantTable:
+		// Suggest in-scope Go table variables first!
+		for varName, tblName := range fi.TableVars {
+			t := s.cat.Table(tblName)
+			items = append(items, map[string]any{
+				"label":      varName,
+				"kind":       6,
+				"detail":     fmt.Sprintf("Go table var -> %s", tblName),
+				"insertText": "` + " + varName + " + `",
+				"sortText":   "0_" + varName,
+				"documentation": map[string]any{"kind": "markdown", "value": tableMD(t)},
+			})
+		}
 		names := s.cat.TableNames()
 		sort.Strings(names)
 		for _, n := range names {
 			t := s.cat.Table(n)
 			items = append(items, map[string]any{
 				"label": n, "kind": 7, "detail": modelDetail(t),
+				"sortText":      "1_" + n,
 				"documentation": map[string]any{"kind": "markdown", "value": tableMD(t)},
 			})
 		}
@@ -298,7 +392,7 @@ func colItem(t *indexer.Table, c *indexer.Column) map[string]any {
 }
 
 func modelDetail(t *indexer.Table) string {
-	if t.Model != "" {
+	if t != nil && t.Model != "" {
 		return "models." + t.Model
 	}
 	return "table"
@@ -325,6 +419,9 @@ func colMD(t *indexer.Table, c *indexer.Column) string {
 		}
 		fmt.Fprintf(&b, "- SQL: `%s %s`\n", c.SQLType, null)
 	}
+	if c.ForeignKey != "" {
+		fmt.Fprintf(&b, "- FK: `%s`\n", c.ForeignKey)
+	}
 	if c.Doc != "" {
 		fmt.Fprintf(&b, "\n%s\n", c.Doc)
 	}
@@ -332,6 +429,9 @@ func colMD(t *indexer.Table, c *indexer.Column) string {
 }
 
 func tableMD(t *indexer.Table) string {
+	if t == nil {
+		return ""
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "**%s**", t.Name)
 	if t.Model != "" {
@@ -345,7 +445,21 @@ func tableMD(t *indexer.Table) string {
 }
 
 func (s *Server) hover(raw json.RawMessage) any {
-	text, _, _, _, d, v, sc, ok := s.resolve(raw)
+	_, path, text, _, off, inputOK := s.resolveInput(raw)
+	if !inputOK {
+		return nil
+	}
+	// 1. Check ORM / Config / Validation spans first
+	fa := orm.AnalyzeFile(path, []byte(text), s.cat)
+	if md, st, en, ok := fa.Hover(off, s.cat); ok {
+		return map[string]any{
+			"contents": map[string]any{"kind": "markdown", "value": md},
+			"range":    Range{offsetToPos(text, st), offsetToPos(text, en)},
+		}
+	}
+
+	// 2. Raw SQL hover
+	_, _, _, _, d, v, sc, ok := s.resolve(raw)
 	if !ok {
 		return nil
 	}
@@ -367,12 +481,8 @@ func (s *Server) hover(raw json.RawMessage) any {
 }
 
 func (s *Server) definition(raw json.RawMessage) any {
-	_, _, _, _, d, v, sc, ok := s.resolve(raw)
-	if !ok {
-		return nil
-	}
-	ref := d.RefAt(v, sc)
-	if ref == nil {
+	_, path, text, _, off, inputOK := s.resolveInput(raw)
+	if !inputOK {
 		return nil
 	}
 	var locs []LocationT
@@ -380,6 +490,25 @@ func (s *Server) definition(raw json.RawMessage) any {
 		if l.Valid() {
 			locs = append(locs, LocationT{pathToURI(l.File), Range{Position{l.Line, l.Col}, Position{l.Line, l.Col + n}}})
 		}
+	}
+
+	// 1. Check ORM / Config / Validation spans first
+	fa := orm.AnalyzeFile(path, []byte(text), s.cat)
+	for _, l := range fa.Definition(off, s.cat) {
+		add(l, 0)
+	}
+	if len(locs) > 0 {
+		return locs
+	}
+
+	// 2. Raw SQL definition
+	_, _, _, _, d, v, sc, ok := s.resolve(raw)
+	if !ok {
+		return nil
+	}
+	ref := d.RefAt(v, sc)
+	if ref == nil {
+		return nil
 	}
 	if ref.Column != nil {
 		add(ref.Column.Loc, len(ref.Column.GoName))
@@ -398,11 +527,19 @@ func (s *Server) diagnose(uri string) {
 	text := s.docs[uri]
 	diags := []map[string]any{}
 	if strings.HasSuffix(uri, ".go") {
-		fi := rawsql.Extract(uriToPath(uri), []byte(text), s.cat)
+		path := uriToPath(uri)
+		fi := rawsql.Extract(path, []byte(text), s.cat)
 		for _, d := range rawsql.Analyze(fi, s.cat) {
 			diags = append(diags, map[string]any{
 				"range":    Range{offsetToPos(text, d.Start), offsetToPos(text, d.End)},
 				"severity": d.Severity, "source": "goravel-sql", "message": d.Message,
+			})
+		}
+		fa := orm.AnalyzeFile(path, []byte(text), s.cat)
+		for _, d := range fa.Diagnostics(s.cat) {
+			diags = append(diags, map[string]any{
+				"range":    Range{offsetToPos(text, d.Start), offsetToPos(text, d.End)},
+				"severity": d.Severity, "source": "goravel", "message": d.Message,
 			})
 		}
 	}
@@ -439,7 +576,154 @@ func (s *Server) codeAction(raw json.RawMessage) any {
 	if at, code, name, ok := rawsql.GenerateRowStruct(fi, s.cat, off); ok {
 		edit("Generate row struct "+name, "refactor.extract", at, at, code)
 	}
+	if d := fi.DocAt(off); d != nil && s.cat.EnvVars["DB_HOST"] != "" {
+		actions = append(actions, map[string]any{
+			"title": "Goravel: Explain SQL Query against DB",
+			"kind":  "quickfix",
+			"command": map[string]any{
+				"title":     "Goravel: Explain SQL Query against DB",
+				"command":   "goravel.explainQuery",
+				"arguments": []any{d.Text},
+			},
+		})
+	}
 	return actions
+}
+
+func (s *Server) codeLens(raw json.RawMessage) any {
+	var p struct {
+		TextDocument struct {
+			URI string `json:"uri"`
+		} `json:"textDocument"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	path := filepath.Clean(uriToPath(p.TextDocument.URI))
+	var lenses []map[string]any
+	for _, r := range s.cat.Routes {
+		if !r.CtrlLoc.Valid() || filepath.Clean(r.CtrlLoc.File) != path {
+			continue
+		}
+		pos := Position{r.CtrlLoc.Line, r.CtrlLoc.Col}
+		lenses = append(lenses, map[string]any{
+			"range": Range{pos, pos},
+			"command": map[string]any{
+				"title":     fmt.Sprintf("$(globe) %s %s", r.Method, r.Path),
+				"command":   "goravel.jumpToRoute",
+				"arguments": []any{pathToURI(r.Loc.File), r.Loc.Line, r.Loc.Col},
+			},
+		})
+	}
+	return lenses
+}
+
+func (s *Server) inlayHint(raw json.RawMessage) any {
+	var p struct {
+		TextDocument struct {
+			URI string `json:"uri"`
+		} `json:"textDocument"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	uri := p.TextDocument.URI
+	text, ok := s.docs[uri]
+	if !ok || !strings.HasSuffix(uri, ".go") {
+		return nil
+	}
+	fa := orm.AnalyzeFile(uriToPath(uri), []byte(text), s.cat)
+	var hints []map[string]any
+	for _, h := range fa.InlayHints(s.cat) {
+		hints = append(hints, map[string]any{
+			"position":    offsetToPos(text, h.Offset),
+			"label":       h.Label,
+			"kind":        2,
+			"paddingLeft": true,
+		})
+	}
+	return hints
+}
+
+func (s *Server) semanticTokens(raw json.RawMessage) any {
+	var p struct {
+		TextDocument struct {
+			URI string `json:"uri"`
+		} `json:"textDocument"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	uri := p.TextDocument.URI
+	text, ok := s.docs[uri]
+	if !ok || !strings.HasSuffix(uri, ".go") {
+		return map[string]any{"data": []int{}}
+	}
+	path := uriToPath(uri)
+	fi := rawsql.Extract(path, []byte(text), s.cat)
+	fa := orm.AnalyzeFile(path, []byte(text), s.cat)
+
+	toks := rawsql.SemanticTokens(fi, s.cat)
+	seen := map[int]bool{}
+	for _, t := range toks {
+		seen[t.GoStart] = true
+	}
+	for _, t := range fa.SemanticTokens() {
+		if !seen[t.GoStart] {
+			toks = append(toks, t)
+		}
+	}
+	sort.Slice(toks, func(i, j int) bool { return toks[i].GoStart < toks[j].GoStart })
+
+	data := make([]int, 0, len(toks)*5)
+	prevLine, prevChar := 0, 0
+	for _, t := range toks {
+		pos := offsetToPos(text, t.GoStart)
+		endPos := offsetToPos(text, t.GoStart+t.Length)
+		if pos.Line != endPos.Line || endPos.Character <= pos.Character {
+			continue
+		}
+		dLine := pos.Line - prevLine
+		dStart := pos.Character - prevChar
+		if dLine > 0 {
+			dStart = pos.Character
+		}
+		if dLine < 0 || dStart < 0 {
+			continue
+		}
+		data = append(data, dLine, dStart, endPos.Character-pos.Character, t.Type, 0)
+		prevLine = pos.Line
+		prevChar = pos.Character
+	}
+	return map[string]any{"data": data}
+}
+
+func (s *Server) overview() any {
+	var tables []*indexer.Table
+	for _, n := range s.cat.TableNames() {
+		tables = append(tables, s.cat.Table(n))
+	}
+	var configs []*indexer.ConfigItem
+	for _, k := range s.cat.ConfigKeys() {
+		configs = append(configs, s.cat.Config(k))
+	}
+	var rules []*indexer.RuleItem
+	for _, r := range s.cat.RuleNames() {
+		rules = append(rules, s.cat.Rule(r))
+	}
+	return map[string]any{
+		"tables":     tables,
+		"routes":     s.cat.Routes,
+		"migrations": s.cat.Migrations,
+		"configs":    configs,
+		"rules":      rules,
+	}
+}
+
+func (s *Server) explainQuery(raw json.RawMessage) any {
+	var p struct {
+		SQL string `json:"sql"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	out, err := indexer.ExplainQuery(s.cat, p.SQL)
+	if err != nil {
+		return map[string]any{"ok": false, "output": out, "error": err.Error()}
+	}
+	return map[string]any{"ok": true, "output": out}
 }
 
 // ---- position helpers (LSP uses UTF-16 columns) ----

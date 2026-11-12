@@ -1,13 +1,109 @@
 {
   "scopeName": "goravel-sql.injection",
-  "injectionSelector": "L:source.go string.quoted.raw.go",
-  "patterns": [{ "include": "#sql" }],
+  "injectionSelector": "L:source.go string.quoted.raw.go, L:source.go string.quoted.double.go",
+  "patterns": [
+    { "include": "#sql-raw-block" },
+    { "include": "#sql-double-block" }
+  ],
   "repository": {
-    "sql": {
-      "begin": "(?i)(?=\\s*(?:SELECT|INSERT\\s+INTO|UPDATE|DELETE\\s+FROM|WITH|CREATE\\s+(?:TABLE|INDEX|POLICY|OR\\s+REPLACE)|ALTER\\s+TABLE|DROP\\s+TABLE)\\b)",
+    "sql-raw-block": {
+      "begin": "(?i)(?=\\s*(?:--|/\\*|SELECT|INSERT\\s+INTO|UPDATE|DELETE\\s+FROM|WITH|CREATE\\s+(?:TABLE|INDEX|UNIQUE\\s+INDEX|POLICY|OR\\s+REPLACE|VIEW|SCHEMA|EXTENSION|TRIGGER|FUNCTION)|ALTER\\s+TABLE|DROP\\s+(?:TABLE|INDEX|POLICY|VIEW|TRIGGER|FUNCTION)|TRUNCATE|FROM|LEFT\\s+(?:OUTER\\s+)?JOIN|RIGHT\\s+(?:OUTER\\s+)?JOIN|INNER\\s+JOIN|FULL\\s+(?:OUTER\\s+)?JOIN|CROSS\\s+JOIN|JOIN|WHERE|AND|OR|ON|ORDER\\s+BY|GROUP\\s+BY|HAVING|LIMIT|OFFSET|VALUES|SET|RETURNING|UNION|[A-Za-z_]\\w*\\s+(?:ON|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|JOIN|WHERE|SET)\\b|[A-Za-z_]\\w*\\s*$))",
       "end": "(?=`)",
       "contentName": "meta.embedded.block.sql",
-      "patterns": [{ "include": "source.sql" }]
+      "patterns": [
+        { "include": "#sql-tokens" }
+      ]
+    },
+    "sql-double-block": {
+      "begin": "(?i)(?=\\s*(?:SELECT\\b|INSERT\\s+INTO\\b|UPDATE\\s+\\S+\\s+SET\\b|DELETE\\s+FROM\\b|WITH\\b|CREATE\\s+(?:TABLE|INDEX|UNIQUE\\s+INDEX|POLICY)|ALTER\\s+TABLE|DROP\\s+TABLE|FROM\\s+|LEFT\\s+(?:OUTER\\s+)?JOIN\\b|RIGHT\\s+(?:OUTER\\s+)?JOIN\\b|INNER\\s+JOIN\\b|JOIN\\s+|WHERE\\s+|AND\\s+[A-Za-z_(]|OR\\s+[A-Za-z_(]|ORDER\\s+BY\\b|GROUP\\s+BY\\b|HAVING\\s+|LIMIT\\s+|OFFSET\\s+|VALUES\\s*\\(|SET\\s+[A-Za-z_]|RETURNING\\b|[A-Za-z_]\\w*\\s+(?:ON|LEFT\\s+JOIN|INNER\\s+JOIN|JOIN|WHERE)\\b|\\(?[A-Za-z_][\\w.]*\\s+(?:ILIKE|LIKE|IS\\s+(?:NOT\\s+)?NULL|IN\\s*\\()|[A-Za-z_][\\w.]*\\s*(?:=|!=|<>|<=|>=|<|>)\\s*(?:\\$\\d+|\\$%[dsv]|\\?)))",
+      "end": "(?=\")",
+      "contentName": "meta.embedded.block.sql",
+      "patterns": [
+        { "include": "#sql-tokens" }
+      ]
+    },
+    "sql-tokens": {
+      "patterns": [
+        {
+          "match": "--.*$",
+          "name": "comment.line.double-dash.sql"
+        },
+        {
+          "begin": "/\\*",
+          "end": "\\*/",
+          "name": "comment.block.sql"
+        },
+        {
+          "match": "'(?:''|[^'])*'",
+          "name": "string.quoted.single.sql"
+        },
+        {
+          "match": "(\\$\\d+|\\$%[dsv]|%[dsv]|\\?)",
+          "name": "variable.parameter.sql"
+        },
+        {
+          "match": "(?i)\\b(AS)\\s+([A-Za-z_]\\w*)",
+          "captures": {
+            "1": { "name": "keyword.control.sql" },
+            "2": { "name": "variable.other.constant.sql" }
+          }
+        },
+        {
+          "match": "(?i)\\b(FROM|JOIN|UPDATE|INTO)\\s+([A-Za-z_][\\w.]*)(?:\\s+(?:(AS)\\s+)?(?!WHERE\\b|LEFT\\b|RIGHT\\b|INNER\\b|OUTER\\b|FULL\\b|CROSS\\b|JOIN\\b|ON\\b|SET\\b|ORDER\\b|GROUP\\b|LIMIT\\b|OFFSET\\b|VALUES\\b|RETURNING\\b)([A-Za-z_]\\w*))?",
+          "captures": {
+            "1": { "name": "keyword.control.sql" },
+            "2": { "name": "entity.name.type.sql" },
+            "3": { "name": "keyword.control.sql" },
+            "4": { "name": "entity.name.type.sql" }
+          }
+        },
+        {
+          "match": "(?i)(?:(?<=`)|^)\\s*(?!SELECT\\b|FROM\\b|WHERE\\b|LEFT\\b|RIGHT\\b|INNER\\b|OUTER\\b|FULL\\b|CROSS\\b|JOIN\\b|ON\\b|AND\\b|OR\\b|ORDER\\b|GROUP\\b|HAVING\\b|LIMIT\\b|OFFSET\\b|INSERT\\b|UPDATE\\b|DELETE\\b|SET\\b|VALUES\\b|RETURNING\\b|WITH\\b|CREATE\\b|ALTER\\b|DROP\\b)([A-Za-z_]\\w*)\\b(?=\\s*(?:$|\\b(?:ON|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|JOIN|WHERE|ORDER|GROUP|LIMIT|SET)\\b))",
+          "captures": {
+            "1": { "name": "entity.name.type.sql" }
+          }
+        },
+        {
+          "match": "\\b([A-Za-z_]\\w*)(\\.)([A-Za-z_]\\w*|\\*)",
+          "captures": {
+            "1": { "name": "entity.name.type.sql" },
+            "2": { "name": "punctuation.accessor.sql" },
+            "3": { "name": "variable.other.property.sql" }
+          }
+        },
+        {
+          "match": "(?i)\\b(COUNT|SUM|AVG|MIN|MAX|COALESCE|NULLIF|NOW|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME|LOWER|UPPER|TRIM|LTRIM|RTRIM|SUBSTRING|CONCAT|LENGTH|CHAR_LENGTH|CAST|EXTRACT|DATE_TRUNC|DATE_PART|TO_CHAR|TO_DATE|TO_TIMESTAMP|AGE|ROW_NUMBER|RANK|DENSE_RANK|LAG|LEAD|FIRST_VALUE|LAST_VALUE|ARRAY_AGG|STRING_AGG|JSON_BUILD_OBJECT|JSONB_BUILD_OBJECT|JSON_AGG|JSONB_AGG|TO_JSONB|GEN_RANDOM_UUID|UUID_GENERATE_V4|ROUND|CEIL|FLOOR|ABS|GREATEST|LEAST)\\s*(?=\\()",
+          "name": "support.function.sql"
+        },
+        {
+          "match": "(?i)\\b(SELECT|DISTINCT|FROM|WHERE|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|NATURAL|JOIN|ON|USING|AS|AND|OR|NOT|IS|IN|EXISTS|BETWEEN|ILIKE|LIKE|SIMILAR|TO|ORDER|GROUP|BY|HAVING|LIMIT|OFFSET|FETCH|FIRST|NEXT|ROWS|ONLY|INSERT|INTO|VALUES|UPDATE|SET|DELETE|RETURNING|WITH|RECURSIVE|UNION|INTERSECT|EXCEPT|ALL|ANY|SOME|CASE|WHEN|THEN|ELSE|END|ASC|DESC|NULLS|LAST|CREATE|ALTER|DROP|TRUNCATE|RENAME|ADD|COLUMN|TABLE|TEMP|TEMPORARY|VIEW|MATERIALIZED|INDEX|UNIQUE|CONCURRENTLY|POLICY|SCHEMA|EXTENSION|TRIGGER|FUNCTION|PROCEDURE|IF|CASCADE|RESTRICT|PRIMARY|FOREIGN|KEY|REFERENCES|CHECK|DEFAULT|CONSTRAINT|CONFLICT|DO|NOTHING|FOR|EACH|ROW|STATEMENT|ENABLE|DISABLE|LEVEL|SECURITY|BEGIN|COMMIT|ROLLBACK|TRANSACTION|GRANT|REVOKE|PUBLIC|OVER|PARTITION|WINDOW|FILTER|WITHIN|LATERAL)\\b",
+          "name": "keyword.control.sql"
+        },
+        {
+          "match": "(?i)\\b(NULL|TRUE|FALSE)\\b",
+          "name": "constant.language.sql"
+        },
+        {
+          "match": "(?i)\\b(UUID|VARCHAR|CHARACTER\\s+VARYING|CHAR|TEXT|INT|INTEGER|INT2|INT4|INT8|BIGINT|SMALLINT|SERIAL|BIGSERIAL|SMALLSERIAL|DECIMAL|NUMERIC|FLOAT|FLOAT4|FLOAT8|DOUBLE\\s+PRECISION|REAL|BOOLEAN|BOOL|DATE|TIME|TIMETZ|TIMESTAMP|TIMESTAMPTZ|WITH\\s+TIME\\s+ZONE|WITHOUT\\s+TIME\\s+ZONE|INTERVAL|JSON|JSONB|BYTEA|INET|CIDR|MACADDR|GEOGRAPHY|GEOMETRY|POINT|LINESTRING|POLYGON|TSVECTOR|TSQUERY)\\b",
+          "name": "storage.type.sql"
+        },
+        {
+          "match": "\\b\\d+(?:\\.\\d+)?\\b",
+          "name": "constant.numeric.sql"
+        },
+        {
+          "match": "\\b[a-z_][a-z0-9_]*\\b",
+          "name": "variable.other.property.sql"
+        },
+        {
+          "match": "(?:!=|<>|<=|>=|::|=|<|>|\\*|\\+|-|/)",
+          "name": "keyword.operator.sql"
+        },
+        {
+          "match": "[,;()]",
+          "name": "punctuation.separator.sql"
+        }
+      ]
     }
   }
 }

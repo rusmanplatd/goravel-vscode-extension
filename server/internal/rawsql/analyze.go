@@ -1,6 +1,7 @@
 package rawsql
 
 import (
+	"fmt"
 	"regexp"
 	"strings"
 
@@ -72,6 +73,17 @@ func (s Scope) Tables() []*indexer.Table {
 	return out
 }
 
+// Aliases returns a map of Table -> shortest alias in scope.
+func (s Scope) Aliases() map[*indexer.Table]string {
+	out := map[*indexer.Table]string{}
+	for k, t := range s {
+		if cur, ok := out[t]; !ok || len(k) < len(cur) {
+			out[t] = k
+		}
+	}
+	return out
+}
+
 // Issue is a diagnostic in virtual coordinates.
 type Issue struct {
 	VStart, VEnd int
@@ -103,9 +115,60 @@ func (d *Doc) Check(sc Scope) []Issue {
 		if strings.HasPrefix(col, "__") {
 			continue
 		}
-		out = append(out, Issue{m[4], m[5], "Column '" + col + "' does not exist on table '" + t.Name + "'"})
+		msg := "Column '" + col + "' does not exist on table '" + t.Name + "'"
+		if sug := closestColumn(t, col); sug != "" {
+			msg += fmt.Sprintf(" (did you mean '%s'?)", sug)
+		}
+		out = append(out, Issue{m[4], m[5], msg})
 	}
 	return out
+}
+
+func closestColumn(t *indexer.Table, col string) string {
+	best, bestDist := "", 3
+	lc := strings.ToLower(col)
+	for _, c := range t.Columns {
+		d := editDistance(lc, strings.ToLower(c.Name))
+		if d < bestDist {
+			bestDist = d
+			best = c.Name
+		}
+	}
+	return best
+}
+
+func editDistance(a, b string) int {
+	if len(a) == 0 {
+		return len(b)
+	}
+	if len(b) == 0 {
+		return len(a)
+	}
+	dp := make([]int, len(b)+1)
+	for j := range dp {
+		dp[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		prev := dp[0]
+		dp[0] = i
+		for j := 1; j <= len(b); j++ {
+			temp := dp[j]
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
+			}
+			v := dp[j] + 1
+			if dp[j-1]+1 < v {
+				v = dp[j-1] + 1
+			}
+			if prev+cost < v {
+				v = prev + cost
+			}
+			dp[j] = v
+			prev = temp
+		}
+	}
+	return dp[len(b)]
 }
 
 // Ref describes what the cursor is on.
@@ -159,15 +222,19 @@ func isWord(b byte) bool {
 
 // CompletionCtx describes what to complete at virtual offset v.
 type CompletionCtx struct {
-	Qualifier string // alias before '.'
-	Prefix    string
-	WantTable bool
+	Qualifier  string // alias before '.'
+	Prefix     string
+	WantTable  bool
+	WantJoinOn bool
+	JoinTable  string
+	JoinAlias  string
 }
 
 var (
-	qualRe  = regexp.MustCompile(`([A-Za-z_]\w*)\.(\w*)$`)
-	tableKw = regexp.MustCompile(`(?i)\b(FROM|JOIN|INTO|UPDATE|TABLE)\s+([\w."]*)$`)
-	prefRe  = regexp.MustCompile(`\w*$`)
+	qualRe   = regexp.MustCompile(`([A-Za-z_]\w*)\.(\w*)$`)
+	tableKw  = regexp.MustCompile(`(?i)\b(FROM|JOIN|INTO|UPDATE|TABLE)\s+([\w."]*)$`)
+	joinOnRe = regexp.MustCompile(`(?i)\bJOIN\s+([A-Za-z_][\w."]*)(?:\s+(?:AS\s+)?([A-Za-z_]\w*))?\s+ON\s+(\w*)$`)
+	prefRe   = regexp.MustCompile(`\w*$`)
 )
 
 func (d *Doc) CompletionAt(v int) CompletionCtx {
@@ -175,8 +242,61 @@ func (d *Doc) CompletionAt(v int) CompletionCtx {
 	if m := qualRe.FindStringSubmatch(before); m != nil {
 		return CompletionCtx{Qualifier: strings.ToLower(m[1]), Prefix: m[2]}
 	}
+	if m := joinOnRe.FindStringSubmatch(before); m != nil {
+		alias := m[2]
+		if alias == "" || strings.EqualFold(alias, "ON") {
+			alias = indexer.StripSchema(m[1])
+		}
+		return CompletionCtx{WantJoinOn: true, JoinTable: m[1], JoinAlias: strings.ToLower(alias), Prefix: m[3]}
+	}
 	if m := tableKw.FindStringSubmatch(before); m != nil {
 		return CompletionCtx{WantTable: true, Prefix: m[2]}
 	}
 	return CompletionCtx{Prefix: prefRe.FindString(before)}
+}
+
+// JoinConditions returns candidate `a.fk = b.pk` expressions for a JOIN ON clause.
+func JoinConditions(joinTable *indexer.Table, joinAlias string, sc Scope) []string {
+	if joinTable == nil {
+		return nil
+	}
+	aliases := sc.Aliases()
+	seen := map[string]bool{}
+	var out []string
+	add := func(s string) {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	for _, other := range sc.Tables() {
+		if other == joinTable {
+			continue
+		}
+		oa := aliases[other]
+		if oa == "" {
+			oa = other.Name
+		}
+		// Check if other has FK to joinTable
+		for _, r := range other.Relations {
+			if r.TargetTable == joinTable.Name && r.ForeignKey != "" {
+				ref := r.References
+				if ref == "" {
+					ref = "id"
+				}
+				add(fmt.Sprintf("%s.%s = %s.%s", oa, r.ForeignKey, joinAlias, ref))
+			}
+		}
+		// Check if joinTable has FK to other
+		for _, r := range joinTable.Relations {
+			if r.TargetTable == other.Name && r.ForeignKey != "" {
+				ref := r.References
+				if ref == "" {
+					ref = "id"
+				}
+				add(fmt.Sprintf("%s.%s = %s.%s", joinAlias, r.ForeignKey, oa, ref))
+			}
+		}
+	}
+	return out
 }

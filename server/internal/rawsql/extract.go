@@ -30,9 +30,10 @@ type Doc struct {
 
 // FileInfo is the extraction result for one Go file.
 type FileInfo struct {
-	Src     []byte
-	Docs    []*Doc
-	Queries []*QueryCall
+	Src       []byte
+	Docs      []*Doc
+	Queries   []*QueryCall
+	TableVars map[string]string // go var name -> table name
 }
 
 var sqlish = regexp.MustCompile(`(?is)^\s*(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+FROM|WITH|CREATE|ALTER|DROP|TRUNCATE|AND|OR|WHERE|ORDER\s+BY|GROUP\s+BY|HAVING|LIMIT|OFFSET|LEFT\s+JOIN|INNER\s+JOIN|RIGHT\s+JOIN|JOIN|SET|FROM|ON)\s`)
@@ -42,7 +43,7 @@ var sqlish = regexp.MustCompile(`(?is)^\s*(SELECT|INSERT\s+INTO|UPDATE|DELETE\s+
 func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 	fset := token.NewFileSet()
 	f, _ := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
-	fi := &FileInfo{Src: src}
+	fi := &FileInfo{Src: src, TableVars: map[string]string{}}
 	if f == nil {
 		return fi
 	}
@@ -53,7 +54,7 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 	off := func(p token.Pos) int { return tf.Offset(p) }
 
 	// variable -> table name
-	vars := map[string]string{}
+	vars := fi.TableVars
 	ast.Inspect(f, func(n ast.Node) bool {
 		as, ok := n.(*ast.AssignStmt)
 		if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
@@ -63,35 +64,8 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 		if !ok {
 			return true
 		}
-		call, ok := as.Rhs[0].(*ast.CallExpr)
-		if !ok {
-			return true
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "TableName" {
-			return true
-		}
-		x := sel.X
-		for {
-			if p, ok := x.(*ast.ParenExpr); ok {
-				x = p.X
-				continue
-			}
-			break
-		}
-		cl, ok := x.(*ast.CompositeLit)
-		if !ok {
-			return true
-		}
-		name := ""
-		switch t := cl.Type.(type) {
-		case *ast.Ident:
-			name = t.Name
-		case *ast.SelectorExpr:
-			name = t.Sel.Name
-		}
-		if tbl := cat.Model(name); tbl != nil {
-			vars[id.Name] = tbl.Name
+		if tname := extractTableNameExpr(as.Rhs[0], cat); tname != "" {
+			vars[id.Name] = tname
 		}
 		return true
 	})
@@ -144,6 +118,8 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 				if isSprintf(x) && len(x.Args) > 0 {
 					d.Dynamic = true
 					flat(x.Args[0], depth)
+				} else if tname := extractTableNameExpr(x, cat); tname != "" {
+					sb.WriteString(tname)
 				} else {
 					d.Dynamic = true
 					sb.WriteString("__call__")
@@ -195,6 +171,40 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 		}
 	}
 	return fi
+}
+
+func extractTableNameExpr(e ast.Expr, cat *indexer.Catalog) string {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return ""
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || sel.Sel.Name != "TableName" {
+		return ""
+	}
+	x := sel.X
+	for {
+		if p, ok := x.(*ast.ParenExpr); ok {
+			x = p.X
+			continue
+		}
+		break
+	}
+	cl, ok := x.(*ast.CompositeLit)
+	if !ok {
+		return ""
+	}
+	name := ""
+	switch t := cl.Type.(type) {
+	case *ast.Ident:
+		name = t.Name
+	case *ast.SelectorExpr:
+		name = t.Sel.Name
+	}
+	if tbl := cat.Model(name); tbl != nil {
+		return tbl.Name
+	}
+	return ""
 }
 
 func anySQL(d *Doc, src []byte) bool {

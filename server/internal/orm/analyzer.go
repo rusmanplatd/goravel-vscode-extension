@@ -1,0 +1,1032 @@
+// Package orm provides AST-based intelligence for Goravel ORM query builders
+// (facades.Orm().Query(), facades.DB().Table(), BuildPatchQuery*), Config keys
+// (facades.Config()), and Request Validation rules (Rules(ctx), Validate()).
+package orm
+
+import (
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+
+	"github.com/rusmanplatd/goravel-lsp/internal/indexer"
+	"github.com/rusmanplatd/goravel-lsp/internal/rawsql"
+)
+
+// SpanKind identifies the kind of string literal span analyzed in Go code.
+type SpanKind int
+
+const (
+	SpanORMWhere    SpanKind = iota // .Where("col = ?", x), .OrWhere, .Having
+	SpanORMColumn                   // .Select("col"), .Group("col"), .Update("col", v), .Pluck("col", &x)
+	SpanORMOrder                    // .Order("col DESC")
+	SpanORMRelation                 // .With("Province.Country")
+	SpanPatchKey                    // patches["col"] or map[string]any{"col": v} passed to BuildPatchQuery*
+	SpanConfigKey                   // facades.Config().GetString("jwt.secret")
+	SpanEnvKey                      // config.Env("JWT_SECRET")
+	SpanRuleField                   // map key in Rules(ctx)
+	SpanRuleValue                   // map value in Rules(ctx) ("required|integer|min:1")
+)
+
+// Span represents a string literal in a Go file with Goravel framework semantics.
+type Span struct {
+	Kind       SpanKind
+	Start      int // byte offset after opening quote
+	End        int // byte offset before closing quote
+	CallEnd    int // byte offset of enclosing call end (for inlay hints)
+	Text       string
+	Table      *indexer.Table      // resolved table for ORM / Patch spans
+	ReqStruct  *indexer.StructInfo // resolved request struct for Rule spans
+}
+
+// FileAnalysis holds all framework spans extracted from a Go source file.
+type FileAnalysis struct {
+	Path  string
+	Src   []byte
+	Spans []*Span
+}
+
+var (
+	ormColMethods   = map[string]bool{"Select": true, "Group": true, "Update": true, "Pluck": true, "Omit": true}
+	ormWhereMethods = map[string]bool{"Where": true, "OrWhere": true, "WhereNot": true, "WhereIn": true, "WhereNotIn": true, "WhereBetween": true, "WhereNull": true, "WhereNotNull": true, "Having": true}
+	cfgGetMethods   = map[string]bool{"Get": true, "GetString": true, "GetInt": true, "GetBool": true, "GetDuration": true}
+	identRe         = regexp.MustCompile(`[A-Za-z_]\w*`)
+	whereSkipWords  = map[string]bool{
+		"and": true, "or": true, "not": true, "is": true, "null": true, "in": true, "like": true, "ilike": true,
+		"between": true, "exists": true, "true": true, "false": true, "asc": true, "desc": true, "as": true,
+		"now": true, "count": true, "sum": true, "avg": true, "min": true, "max": true, "coalesce": true,
+		"lower": true, "upper": true, "date": true, "extract": true, "cast": true,
+	}
+)
+
+// AnalyzeFile extracts ORM, Config, and Validation spans from a Go file.
+func AnalyzeFile(path string, src []byte, cat *indexer.Catalog) *FileAnalysis {
+	fa := &FileAnalysis{Path: path, Src: src}
+	fset := token.NewFileSet()
+	f, _ := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
+	if f == nil {
+		return fa
+	}
+	tf := fset.File(f.Pos())
+	if tf == nil {
+		return fa
+	}
+	off := func(p token.Pos) int { return tf.Offset(p) }
+
+	// 1. Collect receiver helper methods returning a table name (e.g. func (r *Repo) tableName(ctx) string)
+	recvTable := map[string]*indexer.Table{}
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Recv == nil || fd.Body == nil {
+			continue
+		}
+		rname := recvTypeName(fd.Recv)
+		if rname == "" {
+			continue
+		}
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			if call, ok := n.(*ast.CallExpr); ok {
+				if t := tableFromExpr(call, nil, nil, cat); t != nil {
+					recvTable[rname] = t
+					return false
+				}
+			}
+			return true
+		})
+	}
+
+	// 2. Analyze each function declaration
+	for _, decl := range f.Decls {
+		fd, ok := decl.(*ast.FuncDecl)
+		if !ok || fd.Body == nil {
+			continue
+		}
+		rname := ""
+		if fd.Recv != nil {
+			rname = recvTypeName(fd.Recv)
+		}
+		defaultTable := recvTable[rname]
+
+		// Handle Form Request Rules(ctx) methods
+		if fd.Name.Name == "Rules" && rname != "" {
+			reqSt := cat.Struct(rname)
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				cl, ok := n.(*ast.CompositeLit)
+				if !ok {
+					return true
+				}
+				for _, elt := range cl.Elts {
+					kv, ok := elt.(*ast.KeyValueExpr)
+					if !ok {
+						continue
+					}
+					if kl, ok := kv.Key.(*ast.BasicLit); ok && kl.Kind == token.STRING {
+						addLitSpan(fa, off, kl, SpanRuleField, 0, nil, reqSt)
+					}
+					if vl, ok := kv.Value.(*ast.BasicLit); ok && vl.Kind == token.STRING {
+						addLitSpan(fa, off, vl, SpanRuleValue, 0, nil, reqSt)
+					}
+				}
+				return true
+			})
+		}
+
+		// Collect local table variables, model variables, query variables, and patch maps in fd.Body
+		varTable := map[string]*indexer.Table{}
+		patchMaps := map[string]*ast.CompositeLit{}
+		patchAssigns := map[string][]*ast.BasicLit{}
+
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			switch x := n.(type) {
+			case *ast.AssignStmt:
+				if len(x.Lhs) == 1 && len(x.Rhs) == 1 {
+					if id, ok := x.Lhs[0].(*ast.Ident); ok {
+						if t := tableFromExpr(x.Rhs[0], varTable, recvTable, cat); t != nil {
+							varTable[id.Name] = t
+						} else if defaultTable != nil && isQueryExpr(x.Rhs[0]) {
+							varTable[id.Name] = defaultTable
+						}
+						if cl, ok := x.Rhs[0].(*ast.CompositeLit); ok {
+							patchMaps[id.Name] = cl
+						}
+					}
+					if idx, ok := x.Lhs[0].(*ast.IndexExpr); ok {
+						if id, ok := idx.X.(*ast.Ident); ok {
+							if bl, ok := idx.Index.(*ast.BasicLit); ok && bl.Kind == token.STRING {
+								patchAssigns[id.Name] = append(patchAssigns[id.Name], bl)
+							}
+						}
+					}
+				}
+			case *ast.ValueSpec:
+				if x.Type != nil {
+					if t := tableFromTypeExpr(x.Type, cat); t != nil {
+						for _, n := range x.Names {
+							varTable[n.Name] = t
+						}
+					}
+				}
+			}
+			return true
+		})
+
+		// Second pass on fd.Body: inspect CallExprs for ORM chains, BuildPatchQuery*, Config, and Validate
+		ast.Inspect(fd.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+
+			// Check BuildPatchQuery / BuildPatchQueryWithWhere(tableName, id, patches, ...)
+			if id, ok := call.Fun.(*ast.Ident); ok && strings.HasPrefix(id.Name, "BuildPatchQuery") && len(call.Args) >= 3 {
+				t := tableFromExpr(call.Args[0], varTable, recvTable, cat)
+				if t == nil {
+					t = defaultTable
+				}
+				if t != nil {
+					switch p := call.Args[2].(type) {
+					case *ast.Ident:
+						if cl := patchMaps[p.Name]; cl != nil {
+							addMapKeySpans(fa, off, cl, SpanPatchKey, t)
+						}
+						for _, bl := range patchAssigns[p.Name] {
+							addLitSpan(fa, off, bl, SpanPatchKey, 0, t, nil)
+						}
+					case *ast.CompositeLit:
+						addMapKeySpans(fa, off, p, SpanPatchKey, t)
+					}
+				}
+			}
+
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok {
+				return true
+			}
+			mname := sel.Sel.Name
+
+			// Check facades.Config().Get*("...") and config.Env("...")
+			if cfgGetMethods[mname] && len(call.Args) >= 1 && isConfigReceiver(sel.X) {
+				if bl, ok := call.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
+					addLitSpan(fa, off, bl, SpanConfigKey, off(call.End()), nil, nil)
+				}
+				return true
+			}
+			if mname == "Env" && len(call.Args) >= 1 && isConfigReceiver(sel.X) {
+				if bl, ok := call.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
+					addLitSpan(fa, off, bl, SpanEnvKey, off(call.End()), nil, nil)
+				}
+				return true
+			}
+
+			// Check ctx.Request().Validate(map[string]string{...}) or facades.Validation().Make(data, rules)
+			if (mname == "Validate" && len(call.Args) >= 1) || (mname == "Make" && len(call.Args) >= 2 && isValidationReceiver(sel.X)) {
+				argIdx := 0
+				if mname == "Make" {
+					argIdx = 1
+				}
+				if cl, ok := call.Args[argIdx].(*ast.CompositeLit); ok {
+					for _, elt := range cl.Elts {
+						if kv, ok := elt.(*ast.KeyValueExpr); ok {
+							if vl, ok := kv.Value.(*ast.BasicLit); ok && vl.Kind == token.STRING {
+								addLitSpan(fa, off, vl, SpanRuleValue, 0, nil, nil)
+							}
+						}
+					}
+				}
+			}
+
+			// Check ORM methods: .Where, .Order, .Select, .With, etc. (exclude direct facades.DB().Select/Update)
+			if isDirectDBCall(sel.X) {
+				return true
+			}
+			if ormWhereMethods[mname] || ormColMethods[mname] || mname == "Order" || mname == "With" {
+				t := tableFromExpr(call, varTable, recvTable, cat)
+				if t == nil && isQueryChain(sel.X) {
+					t = defaultTable
+				}
+				if t == nil {
+					return true
+				}
+				switch {
+				case ormWhereMethods[mname] && len(call.Args) >= 1:
+					if bl, ok := call.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
+						addLitSpan(fa, off, bl, SpanORMWhere, 0, t, nil)
+					}
+				case mname == "Order" && len(call.Args) >= 1:
+					if bl, ok := call.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
+						addLitSpan(fa, off, bl, SpanORMOrder, 0, t, nil)
+					}
+				case mname == "With" && len(call.Args) >= 1:
+					if bl, ok := call.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
+						addLitSpan(fa, off, bl, SpanORMRelation, 0, t, nil)
+					}
+				case ormColMethods[mname]:
+					for i, arg := range call.Args {
+						if (mname == "Update" || mname == "Pluck") && i > 0 {
+							break
+						}
+						if bl, ok := arg.(*ast.BasicLit); ok && bl.Kind == token.STRING {
+							addLitSpan(fa, off, bl, SpanORMColumn, 0, t, nil)
+						}
+					}
+				}
+			}
+			return true
+		})
+	}
+	return fa
+}
+
+func addMapKeySpans(fa *FileAnalysis, off func(token.Pos) int, cl *ast.CompositeLit, kind SpanKind, t *indexer.Table) {
+	for _, elt := range cl.Elts {
+		if kv, ok := elt.(*ast.KeyValueExpr); ok {
+			if kl, ok := kv.Key.(*ast.BasicLit); ok && kl.Kind == token.STRING {
+				addLitSpan(fa, off, kl, kind, 0, t, nil)
+			}
+		}
+	}
+}
+
+func addLitSpan(fa *FileAnalysis, off func(token.Pos) int, bl *ast.BasicLit, kind SpanKind, callEnd int, t *indexer.Table, req *indexer.StructInfo) {
+	s := off(bl.Pos()) + 1
+	e := off(bl.End()) - 1
+	if e < s {
+		return
+	}
+	val, err := strconv.Unquote(bl.Value)
+	if err != nil {
+		val = string(fa.Src[s:e])
+	}
+	fa.Spans = append(fa.Spans, &Span{
+		Kind:      kind,
+		Start:     s,
+		End:       e,
+		CallEnd:   callEnd,
+		Text:      val,
+		Table:     t,
+		ReqStruct: req,
+	})
+}
+
+func isConfigReceiver(e ast.Expr) bool {
+	switch x := e.(type) {
+	case *ast.Ident:
+		return x.Name == "config" || x.Name == "cfg"
+	case *ast.CallExpr:
+		if sel, ok := x.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "Config" {
+			return true
+		}
+	}
+	return false
+}
+
+func isValidationReceiver(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "Validation"
+}
+
+func isDirectDBCall(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "DB"
+}
+
+func isQueryChain(e ast.Expr) bool {
+	switch x := e.(type) {
+	case *ast.Ident:
+		return x.Name == "query" || x.Name == "q" || x.Name == "tx" || x.Name == "db"
+	case *ast.CallExpr:
+		return isQueryExpr(x)
+	}
+	return false
+}
+
+func isQueryExpr(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	switch sel.Sel.Name {
+	case "Query", "Table", "Model", "Where", "OrWhere", "Select", "Order", "With", "scoped", "build":
+		return true
+	}
+	return isQueryExpr(sel.X)
+}
+
+func tableFromExpr(e ast.Expr, varTable map[string]*indexer.Table, recvTable map[string]*indexer.Table, cat *indexer.Catalog) *indexer.Table {
+	switch x := e.(type) {
+	case *ast.Ident:
+		if varTable != nil {
+			if t := varTable[x.Name]; t != nil {
+				return t
+			}
+		}
+		if strings.HasSuffix(x.Name, "OriginalTableName") {
+			// Look up via Models
+			modelName := strings.TrimSuffix(x.Name, "OriginalTableName")
+			if t := cat.Model(modelName); t != nil {
+				return t
+			}
+		}
+	case *ast.BasicLit:
+		if x.Kind == token.STRING {
+			if s, err := strconv.Unquote(x.Value); err == nil {
+				return cat.Table(s)
+			}
+		}
+	case *ast.UnaryExpr:
+		return tableFromExpr(x.X, varTable, recvTable, cat)
+	case *ast.ParenExpr:
+		return tableFromExpr(x.X, varTable, recvTable, cat)
+	case *ast.CompositeLit:
+		return tableFromTypeExpr(x.Type, cat)
+	case *ast.CallExpr:
+		sel, ok := x.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return nil
+		}
+		switch sel.Sel.Name {
+		case "TableName":
+			return tableFromExpr(sel.X, varTable, recvTable, cat)
+		case "Table":
+			if len(x.Args) > 0 {
+				if t := tableFromExpr(x.Args[0], varTable, recvTable, cat); t != nil {
+					return t
+				}
+			}
+		case "Model":
+			if len(x.Args) > 0 {
+				if t := tableFromExpr(x.Args[0], varTable, recvTable, cat); t != nil {
+					return t
+				}
+			}
+		case "Find", "First", "Get", "Scan":
+			if len(x.Args) > 0 {
+				if t := tableFromExpr(x.Args[0], varTable, recvTable, cat); t != nil {
+					return t
+				}
+			}
+		}
+		if t := tableFromExpr(sel.X, varTable, recvTable, cat); t != nil {
+			return t
+		}
+	}
+	return nil
+}
+
+func tableFromTypeExpr(e ast.Expr, cat *indexer.Catalog) *indexer.Table {
+	if e == nil {
+		return nil
+	}
+	switch t := e.(type) {
+	case *ast.Ident:
+		return cat.Model(t.Name)
+	case *ast.SelectorExpr:
+		return cat.Model(t.Sel.Name)
+	case *ast.StarExpr:
+		return tableFromTypeExpr(t.X, cat)
+	case *ast.ArrayType:
+		return tableFromTypeExpr(t.Elt, cat)
+	}
+	return nil
+}
+
+func recvTypeName(fl *ast.FieldList) string {
+	if len(fl.List) == 0 {
+		return ""
+	}
+	switch t := fl.List[0].Type.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		if id, ok := t.X.(*ast.Ident); ok {
+			return id.Name
+		}
+	}
+	return ""
+}
+
+// SpanAt returns the Span containing Go byte offset goOff.
+func (fa *FileAnalysis) SpanAt(goOff int) *Span {
+	for _, s := range fa.Spans {
+		if goOff >= s.Start && goOff <= s.End {
+			return s
+		}
+	}
+	return nil
+}
+
+// Completion returns LSP completion items at Go byte offset goOff if inside a framework Span.
+func (fa *FileAnalysis) Completion(goOff int, cat *indexer.Catalog) ([]map[string]any, bool) {
+	sp := fa.SpanAt(goOff)
+	if sp == nil {
+		return nil, false
+	}
+	var items []map[string]any
+	switch sp.Kind {
+	case SpanORMWhere, SpanORMColumn, SpanORMOrder, SpanPatchKey:
+		if sp.Table == nil {
+			return nil, false
+		}
+		for _, c := range sp.Table.Columns {
+			items = append(items, map[string]any{
+				"label": c.Name, "kind": 5,
+				"detail":        colTypeDetail(c),
+				"documentation": map[string]any{"kind": "markdown", "value": colDocMD(sp.Table, c)},
+			})
+		}
+		if sp.Kind == SpanORMOrder {
+			for _, kw := range []string{"ASC", "DESC", "NULLS FIRST", "NULLS LAST"} {
+				items = append(items, map[string]any{"label": kw, "kind": 14})
+			}
+		}
+		return items, true
+
+	case SpanORMRelation:
+		t := resolveRelationChainTable(sp.Table, sp.Text[:goOff-sp.Start], cat)
+		if t == nil {
+			return nil, false
+		}
+		for _, r := range t.Relations {
+			if r.Name == "" {
+				continue
+			}
+			items = append(items, map[string]any{
+				"label": r.Name, "kind": 8,
+				"detail": fmt.Sprintf("-> models.%s (%s.%s)", r.TargetModel, r.TargetTable, r.ForeignKey),
+			})
+		}
+		return items, true
+
+	case SpanConfigKey:
+		for _, k := range cat.ConfigKeys() {
+			ci := cat.Config(k)
+			detail := ci.Default
+			if ci.EnvKey != "" {
+				detail = fmt.Sprintf("Env(%s, %s)", ci.EnvKey, ci.Default)
+			}
+			items = append(items, map[string]any{
+				"label": k, "kind": 21, "detail": detail,
+				"documentation": map[string]any{"kind": "markdown", "value": configDocMD(ci)},
+			})
+		}
+		return items, true
+
+	case SpanEnvKey:
+		var keys []string
+		for k := range cat.EnvVars {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			items = append(items, map[string]any{
+				"label": k, "kind": 21, "detail": cat.EnvVars[k],
+			})
+		}
+		return items, true
+
+	case SpanRuleField:
+		if sp.ReqStruct == nil {
+			return nil, false
+		}
+		for _, f := range sp.ReqStruct.Fields {
+			items = append(items, map[string]any{
+				"label": f.Col, "kind": 5, "detail": fmt.Sprintf("%s.%s (%s)", sp.ReqStruct.Name, f.GoName, f.GoType),
+			})
+		}
+		return items, true
+
+	case SpanRuleValue:
+		before := sp.Text[:goOff-sp.Start]
+		seg := before
+		if i := strings.LastIndexByte(before, '|'); i >= 0 {
+			seg = before[i+1:]
+		}
+		// Check `exists:table,col` or `unique:table,col`
+		if strings.HasPrefix(seg, "exists:") || strings.HasPrefix(seg, "unique:") {
+			arg := seg[strings.IndexByte(seg, ':')+1:]
+			if comma := strings.IndexByte(arg, ','); comma >= 0 {
+				tname := arg[:comma]
+				if t := cat.Table(tname); t != nil {
+					for _, c := range t.Columns {
+						items = append(items, map[string]any{"label": c.Name, "kind": 5, "detail": colTypeDetail(c)})
+					}
+					return items, true
+				}
+			} else {
+				for _, tn := range cat.TableNames() {
+					items = append(items, map[string]any{"label": tn, "kind": 7, "detail": "table"})
+				}
+				return items, true
+			}
+		}
+		for _, rn := range cat.RuleNames() {
+			ri := cat.Rule(rn)
+			detail := "built-in rule"
+			if ri.Custom {
+				detail = "custom rule (app/rules)"
+			}
+			items = append(items, map[string]any{
+				"label": rn, "kind": 12, "detail": detail,
+				"documentation": map[string]any{"kind": "markdown", "value": ruleDocMD(ri)},
+			})
+		}
+		return items, true
+	}
+	return nil, false
+}
+
+// Hover returns Markdown hover contents and byte range [start, end] at goOff.
+func (fa *FileAnalysis) Hover(goOff int, cat *indexer.Catalog) (md string, start, end int, ok bool) {
+	sp := fa.SpanAt(goOff)
+	if sp == nil {
+		return "", 0, 0, false
+	}
+	relOff := goOff - sp.Start
+	switch sp.Kind {
+	case SpanORMWhere, SpanORMColumn, SpanORMOrder, SpanPatchKey:
+		if sp.Table == nil {
+			return "", 0, 0, false
+		}
+		w, ws, we := wordAt(sp.Text, relOff)
+		if w == "" {
+			return "", 0, 0, false
+		}
+		if col := sp.Table.Column(w); col != nil {
+			return colDocMD(sp.Table, col), sp.Start + ws, sp.Start + we, true
+		}
+
+	case SpanORMRelation:
+		r, rs, re := relationAt(sp.Table, sp.Text, relOff, cat)
+		if r != nil {
+			var b strings.Builder
+			fmt.Fprintf(&b, "**Relation `%s`** → `models.%s` (`%s`)\n\n", r.Name, r.TargetModel, r.TargetTable)
+			if r.ForeignKey != "" {
+				fmt.Fprintf(&b, "- Foreign Key: `%s` → `%s.%s`\n", r.ForeignKey, r.TargetTable, r.References)
+			}
+			return b.String(), sp.Start + rs, sp.Start + re, true
+		}
+
+	case SpanConfigKey:
+		if ci := cat.Config(sp.Text); ci != nil {
+			return configDocMD(ci), sp.Start, sp.End, true
+		}
+		if val, exists := cat.EnvVars[sp.Text]; exists {
+			return fmt.Sprintf("**Env `%s`**\n\n- Value in `.env*`: `%s`", sp.Text, val), sp.Start, sp.End, true
+		}
+
+	case SpanEnvKey:
+		if val, exists := cat.EnvVars[sp.Text]; exists {
+			return fmt.Sprintf("**Env `%s`**\n\n- Value in `.env*`: `%s`", sp.Text, val), sp.Start, sp.End, true
+		}
+
+	case SpanRuleField:
+		if sp.ReqStruct != nil {
+			if f := sp.ReqStruct.Has(sp.Text); f != nil {
+				return fmt.Sprintf("**`%s.%s`** (`%s`)", sp.ReqStruct.Name, f.GoName, f.GoType), sp.Start, sp.End, true
+			}
+		}
+
+	case SpanRuleValue:
+		rname, rs, re := ruleSegmentAt(sp.Text, relOff)
+		if ri := cat.Rule(rname); ri != nil {
+			return ruleDocMD(ri), sp.Start + rs, sp.Start + re, true
+		}
+	}
+	return "", 0, 0, false
+}
+
+// Definition returns target locations for Go-to-Definition at goOff.
+func (fa *FileAnalysis) Definition(goOff int, cat *indexer.Catalog) []indexer.Location {
+	sp := fa.SpanAt(goOff)
+	if sp == nil {
+		return nil
+	}
+	relOff := goOff - sp.Start
+	var locs []indexer.Location
+	add := func(l indexer.Location) {
+		if l.Valid() {
+			locs = append(locs, l)
+		}
+	}
+	switch sp.Kind {
+	case SpanORMWhere, SpanORMColumn, SpanORMOrder, SpanPatchKey:
+		if sp.Table == nil {
+			return nil
+		}
+		w, _, _ := wordAt(sp.Text, relOff)
+		if col := sp.Table.Column(w); col != nil {
+			add(col.Loc)
+			add(col.MigLoc)
+		}
+
+	case SpanORMRelation:
+		r, _, _ := relationAt(sp.Table, sp.Text, relOff, cat)
+		if r != nil {
+			add(r.Loc)
+			if target := cat.Model(r.TargetModel); target != nil {
+				add(target.Loc)
+			}
+		}
+
+	case SpanConfigKey:
+		if ci := cat.Config(sp.Text); ci != nil {
+			add(ci.Loc)
+		}
+
+	case SpanRuleField:
+		if sp.ReqStruct != nil {
+			if f := sp.ReqStruct.Has(sp.Text); f != nil {
+				add(f.Loc)
+			}
+		}
+
+	case SpanRuleValue:
+		rname, _, _ := ruleSegmentAt(sp.Text, relOff)
+		if ri := cat.Rule(rname); ri != nil && ri.Loc.Valid() {
+			add(ri.Loc)
+		}
+	}
+	return locs
+}
+
+// Diagnostics validates ORM columns, relations, patch keys, config keys, and validation rules.
+func (fa *FileAnalysis) Diagnostics(cat *indexer.Catalog) []rawsql.Diag {
+	var out []rawsql.Diag
+	for _, sp := range fa.Spans {
+		switch sp.Kind {
+		case SpanORMColumn, SpanPatchKey:
+			if sp.Table == nil || strings.Contains(sp.Text, "(") || strings.Contains(sp.Text, "*") || strings.Contains(sp.Text, " ") {
+				continue
+			}
+			for _, part := range strings.Split(sp.Text, ",") {
+				col := strings.TrimSpace(part)
+				if i := strings.LastIndexByte(col, '.'); i >= 0 {
+					col = col[i+1:]
+				}
+				if col != "" && sp.Table.Column(col) == nil {
+					out = append(out, rawsql.Diag{
+						Start: sp.Start, End: sp.End, Severity: 1,
+						Message: fmt.Sprintf("Column '%s' does not exist on table '%s'", col, sp.Table.Name),
+					})
+				}
+			}
+
+		case SpanORMOrder:
+			if sp.Table == nil {
+				continue
+			}
+			fields := strings.Fields(sp.Text)
+			if len(fields) > 0 {
+				col := fields[0]
+				if i := strings.LastIndexByte(col, '.'); i >= 0 {
+					col = col[i+1:]
+				}
+				if !strings.Contains(col, "(") && sp.Table.Column(col) == nil {
+					out = append(out, rawsql.Diag{
+						Start: sp.Start, End: sp.Start + len(fields[0]), Severity: 1,
+						Message: fmt.Sprintf("Column '%s' does not exist on table '%s'", col, sp.Table.Name),
+					})
+				}
+			}
+
+		case SpanORMWhere:
+			if sp.Table == nil {
+				continue
+			}
+			// Mask single-quoted strings before scanning identifiers
+			masked := strMask(sp.Text)
+			for _, m := range identRe.FindAllStringIndex(masked, -1) {
+				w := masked[m[0]:m[1]]
+				lw := strings.ToLower(w)
+				if whereSkipWords[lw] || (w[0] >= '0' && w[0] <= '9') {
+					continue
+				}
+				// Skip if followed by '(' (SQL function) or '.' (table qualifier)
+				if m[1] < len(masked) && (masked[m[1]] == '(' || masked[m[1]] == '.') {
+					continue
+				}
+				if sp.Table.Column(w) == nil {
+					out = append(out, rawsql.Diag{
+						Start: sp.Start + m[0], End: sp.Start + m[1], Severity: 1,
+						Message: fmt.Sprintf("Column '%s' does not exist on table '%s'", w, sp.Table.Name),
+					})
+				}
+			}
+
+		case SpanORMRelation:
+			if sp.Table == nil || len(sp.Table.Relations) == 0 {
+				continue
+			}
+			curr := sp.Table
+			off := 0
+			for _, part := range strings.Split(sp.Text, ".") {
+				plen := len(part)
+				if curr == nil {
+					break
+				}
+				r := curr.Relation(part)
+				if r == nil {
+					out = append(out, rawsql.Diag{
+						Start: sp.Start + off, End: sp.Start + off + plen, Severity: 2,
+						Message: fmt.Sprintf("Relation '%s' is not defined on model '%s'", part, curr.Model),
+					})
+					break
+				}
+				curr = cat.Model(r.TargetModel)
+				off += plen + 1
+			}
+
+		case SpanConfigKey:
+			if len(cat.Configs) > 0 && cat.Config(sp.Text) == nil {
+				if _, ok := cat.EnvVars[sp.Text]; ok {
+					continue
+				}
+				// Allow top-level namespace access like facades.Config().Get("app")
+				hasPrefix := false
+				prefix := sp.Text + "."
+				for k := range cat.Configs {
+					if strings.HasPrefix(k, prefix) {
+						hasPrefix = true
+						break
+					}
+				}
+				if !hasPrefix {
+					out = append(out, rawsql.Diag{
+						Start: sp.Start, End: sp.End, Severity: 2,
+						Message: fmt.Sprintf("Unknown config key '%s'", sp.Text),
+					})
+				}
+			}
+
+		case SpanRuleValue:
+			off := 0
+			for _, part := range strings.Split(sp.Text, "|") {
+				plen := len(part)
+				rname := part
+				if i := strings.IndexByte(part, ':'); i >= 0 {
+					rname = part[:i]
+				}
+				rname = strings.TrimSpace(rname)
+				if rname != "" && cat.Rule(rname) == nil {
+					out = append(out, rawsql.Diag{
+						Start: sp.Start + off, End: sp.Start + off + len(rname), Severity: 2,
+						Message: fmt.Sprintf("Unknown validation rule '%s'", rname),
+					})
+				}
+				off += plen + 1
+			}
+		}
+	}
+	return out
+}
+
+// SemanticTokens returns semantic tokens for ORM Where/Order/Select/Relation strings.
+func (fa *FileAnalysis) SemanticTokens() []rawsql.SemToken {
+	var out []rawsql.SemToken
+	for _, sp := range fa.Spans {
+		switch sp.Kind {
+		case SpanORMWhere, SpanORMOrder, SpanORMColumn:
+			masked := strMask(sp.Text)
+			for _, m := range identRe.FindAllStringIndex(masked, -1) {
+				w := masked[m[0]:m[1]]
+				lw := strings.ToLower(w)
+				if whereSkipWords[lw] {
+					out = append(out, rawsql.SemToken{GoStart: sp.Start + m[0], Length: m[1] - m[0], Type: rawsql.SemKeyword})
+				} else if sp.Table != nil && sp.Table.Column(w) != nil {
+					out = append(out, rawsql.SemToken{GoStart: sp.Start + m[0], Length: m[1] - m[0], Type: rawsql.SemProperty})
+				}
+			}
+			for i := 0; i < len(sp.Text); i++ {
+				if sp.Text[i] == '?' {
+					out = append(out, rawsql.SemToken{GoStart: sp.Start + i, Length: 1, Type: rawsql.SemParameter})
+				}
+			}
+		}
+	}
+	return out
+}
+
+// InlayHint describes a virtual hint displayed next to Config calls.
+type InlayHint struct {
+	Offset int
+	Label  string
+}
+
+func (fa *FileAnalysis) InlayHints(cat *indexer.Catalog) []InlayHint {
+	var out []InlayHint
+	for _, sp := range fa.Spans {
+		if sp.Kind == SpanConfigKey && sp.CallEnd > 0 {
+			if ci := cat.Config(sp.Text); ci != nil {
+				lbl := ci.Default
+				if ci.EnvKey != "" {
+					lbl = fmt.Sprintf("→ %s (default: %s)", ci.EnvKey, ci.Default)
+				}
+				if lbl != "" {
+					out = append(out, InlayHint{Offset: sp.CallEnd, Label: " " + lbl})
+				}
+			}
+		}
+	}
+	return out
+}
+
+func strMask(s string) string {
+	b := []byte(s)
+	inStr := false
+	for i := range b {
+		if b[i] == '\'' {
+			inStr = !inStr
+			b[i] = ' '
+		} else if inStr {
+			b[i] = ' '
+		}
+	}
+	return string(b)
+}
+
+func resolveRelationChainTable(base *indexer.Table, before string, cat *indexer.Catalog) *indexer.Table {
+	if base == nil {
+		return nil
+	}
+	parts := strings.Split(before, ".")
+	curr := base
+	for i := 0; i < len(parts)-1; i++ {
+		if curr == nil {
+			return nil
+		}
+		r := curr.Relation(parts[i])
+		if r == nil {
+			return nil
+		}
+		curr = cat.Model(r.TargetModel)
+	}
+	return curr
+}
+
+func relationAt(base *indexer.Table, text string, relOff int, cat *indexer.Catalog) (r *indexer.Relation, start, end int) {
+	if base == nil {
+		return nil, 0, 0
+	}
+	curr := base
+	off := 0
+	for _, part := range strings.Split(text, ".") {
+		plen := len(part)
+		if curr == nil {
+			return nil, 0, 0
+		}
+		rel := curr.Relation(part)
+		if rel == nil {
+			return nil, 0, 0
+		}
+		if relOff >= off && relOff <= off+plen {
+			return rel, off, off + plen
+		}
+		curr = cat.Model(rel.TargetModel)
+		off += plen + 1
+	}
+	return nil, 0, 0
+}
+
+func wordAt(s string, off int) (string, int, int) {
+	for _, m := range identRe.FindAllStringIndex(s, -1) {
+		if off >= m[0] && off <= m[1] {
+			return s[m[0]:m[1]], m[0], m[1]
+		}
+	}
+	return "", 0, 0
+}
+
+func ruleSegmentAt(s string, off int) (name string, start, end int) {
+	pos := 0
+	for _, part := range strings.Split(s, "|") {
+		plen := len(part)
+		if off >= pos && off <= pos+plen {
+			rname := part
+			if i := strings.IndexByte(part, ':'); i >= 0 {
+				rname = part[:i]
+			}
+			return strings.TrimSpace(rname), pos, pos + len(rname)
+		}
+		pos += plen + 1
+	}
+	return "", 0, 0
+}
+
+func colTypeDetail(c *indexer.Column) string {
+	if c.SQLType != "" {
+		return c.SQLType
+	}
+	return c.GoType
+}
+
+func colDocMD(t *indexer.Table, c *indexer.Column) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**%s.%s**\n\n", t.Name, c.Name)
+	if c.GoName != "" {
+		fmt.Fprintf(&b, "- Go: `%s.%s` (`%s`)\n", t.Model, c.GoName, c.GoType)
+	}
+	if c.SQLType != "" {
+		null := "NOT NULL"
+		if c.Nullable {
+			null = "NULL"
+		}
+		fmt.Fprintf(&b, "- SQL: `%s %s`\n", c.SQLType, null)
+	}
+	if c.ForeignKey != "" {
+		fmt.Fprintf(&b, "- FK: `%s`\n", c.ForeignKey)
+	}
+	if c.Doc != "" {
+		fmt.Fprintf(&b, "\n%s\n", c.Doc)
+	}
+	return b.String()
+}
+
+func configDocMD(ci *indexer.ConfigItem) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "**Config `%s`**\n\n", ci.Key)
+	if ci.EnvKey != "" {
+		fmt.Fprintf(&b, "- Env Variable: `%s`\n", ci.EnvKey)
+	}
+	if ci.Default != "" {
+		fmt.Fprintf(&b, "- Default Value: `%s`\n", ci.Default)
+	}
+	if ci.EnvVal != "" {
+		fmt.Fprintf(&b, "- `.env` Value: `%s`\n", ci.EnvVal)
+	}
+	if ci.Loc.Valid() {
+		fmt.Fprintf(&b, "- File: `%s:%d`\n", ci.Loc.File, ci.Loc.Line+1)
+	}
+	return b.String()
+}
+
+func ruleDocMD(ri *indexer.RuleItem) string {
+	var b strings.Builder
+	kind := "Built-in Validation Rule"
+	if ri.Custom {
+		kind = "Custom Validation Rule (`app/rules`)"
+	}
+	fmt.Fprintf(&b, "**`%s`** — *%s*\n\n", ri.Name, kind)
+	if ri.Doc != "" {
+		fmt.Fprintf(&b, "%s\n\n", ri.Doc)
+	}
+	if ri.Message != "" {
+		fmt.Fprintf(&b, "- Message: *\"%s\"*\n", ri.Message)
+	}
+	return b.String()
+}

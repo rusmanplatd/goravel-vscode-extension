@@ -210,3 +210,116 @@ func TestGenerateRowStructAction(t *testing.T) {
 		}
 	}
 }
+
+func TestJoinOnAndTableVarCompletion(t *testing.T) {
+	root, uri, text := fixture(t)
+	res := run(t, init1(root), open(uri, text),
+		req(2, "textDocument/completion", uri, posAfter(text, "` p ON ", 0)),
+		req(3, "textDocument/completion", uri, posAfter(text, "SELECT COUNT(*) FROM ", 0)),
+		map[string]any{"method": "exit"})
+	joinOn, _ := json.Marshal(find(res, 2)["result"])
+	if !strings.Contains(string(joinOn), "ct.province_id = p.id") {
+		t.Errorf("expected FK join condition, got %s", joinOn)
+	}
+	tblComp, _ := json.Marshal(find(res, 3)["result"])
+	if !strings.Contains(string(tblComp), "refGeoCityTableName") || !strings.Contains(string(tblComp), "ref_geo_cities") {
+		t.Errorf("expected Go table var and table name, got %s", tblComp)
+	}
+}
+
+func TestORMIntelligence(t *testing.T) {
+	root, _, _ := fixture(t)
+	uri := "file://" + filepath.Join(root, "app/repositories/orm_repo.go")
+	src := `package repositories
+import (
+	"github.com/rusmanplatd/basegoravel/app/facades"
+	"github.com/rusmanplatd/basegoravel/app/models"
+)
+func QueryCities() {
+	refGeoCityTableName := (models.RefGeoCity{}).TableName()
+	facades.Orm().Query().Model(&models.RefGeoCity{}).With("Province").Where("province_id = ?", 1).Order("bad_col DESC")
+	patches := map[string]any{"name": "A", "unknown_patch": 1}
+	BuildPatchQueryWithWhere(refGeoCityTableName, 1, patches, false)
+}
+`
+	res := run(t, init1(root), open(uri, src),
+		req(2, "textDocument/completion", uri, posAfter(src, `With("`, 0)),
+		req(3, "textDocument/hover", uri, posAfter(src, `Where("province`, 0)),
+		map[string]any{"method": "exit"})
+	withComp, _ := json.Marshal(find(res, 2)["result"])
+	if !strings.Contains(string(withComp), `"label":"Province"`) {
+		t.Errorf("expected Province relation completion, got %s", withComp)
+	}
+	whHover, _ := json.Marshal(find(res, 3)["result"])
+	if !strings.Contains(string(whHover), "RefGeoCity.ProvinceID") {
+		t.Errorf("expected hover on Where column, got %s", whHover)
+	}
+	diags := diagsOf(res)
+	if !strings.Contains(diags, "Column 'bad_col' does not exist on table 'ref_geo_cities'") {
+		t.Errorf("expected Order unknown column diagnostic, got %s", diags)
+	}
+	if !strings.Contains(diags, "Column 'unknown_patch' does not exist on table 'ref_geo_cities'") {
+		t.Errorf("expected BuildPatchQuery unknown column diagnostic, got %s", diags)
+	}
+}
+
+func TestConfigRouteAndValidationIntelligence(t *testing.T) {
+	root, _, _ := fixture(t)
+	ctrlPath := filepath.Join(root, "app/http/controllers/city_controller.go")
+	ctrlBytes, _ := os.ReadFile(ctrlPath)
+	ctrlURI := "file://" + ctrlPath
+	ctrlText := string(ctrlBytes)
+
+	reqPath := filepath.Join(root, "app/http/requests/city_request.go")
+	reqBytes, _ := os.ReadFile(reqPath)
+	reqURI := "file://" + reqPath
+	reqText := string(reqBytes)
+
+	res := run(t, init1(root),
+		open(ctrlURI, ctrlText),
+		open(reqURI, reqText),
+		req(2, "textDocument/hover", ctrlURI, posAfter(ctrlText, `"jwt.`, 2)),
+		req(3, "textDocument/definition", ctrlURI, posAfter(ctrlText, `"jwt.`, 2)),
+		map[string]any{"id": 4, "method": "textDocument/codeLens", "params": map[string]any{"textDocument": map[string]any{"uri": ctrlURI}}},
+		req(5, "textDocument/hover", reqURI, posAfter(reqText, "alpha_dash_", 0)),
+		req(6, "textDocument/definition", reqURI, posAfter(reqText, "alpha_dash_", 0)),
+		map[string]any{"id": 7, "method": "goravel/overview", "params": map[string]any{}},
+		map[string]any{"method": "exit"})
+
+	cfgHov, _ := json.Marshal(find(res, 2)["result"])
+	if !strings.Contains(string(cfgHov), "JWT_SECRET") || !strings.Contains(string(cfgHov), "default-secret") {
+		t.Errorf("config hover: %s", cfgHov)
+	}
+	cfgDef, _ := json.Marshal(find(res, 3)["result"])
+	if !strings.Contains(string(cfgDef), "config/jwt.go") {
+		t.Errorf("config definition: %s", cfgDef)
+	}
+	lenses, _ := json.Marshal(find(res, 4)["result"])
+	if !strings.Contains(string(lenses), "GET /api/v1/geo/cities") {
+		t.Errorf("controller codeLens: %s", lenses)
+	}
+	ruleHov, _ := json.Marshal(find(res, 5)["result"])
+	if !strings.Contains(string(ruleHov), "alpha_dash_custom") || !strings.Contains(string(ruleHov), "letters, numbers, dashes") {
+		t.Errorf("rule hover: %s", ruleHov)
+	}
+	ruleDef, _ := json.Marshal(find(res, 6)["result"])
+	if !strings.Contains(string(ruleDef), "app/rules/alpha_dash.go") {
+		t.Errorf("rule definition: %s", ruleDef)
+	}
+	ov, _ := json.Marshal(find(res, 7)["result"])
+	if !strings.Contains(string(ov), "/api/v1/geo/cities") || !strings.Contains(string(ov), "jwt.secret") {
+		t.Errorf("overview: %s", ov)
+	}
+}
+
+func TestSemanticTokens(t *testing.T) {
+	root, uri, text := fixture(t)
+	res := run(t, init1(root), open(uri, text),
+		map[string]any{"id": 2, "method": "textDocument/semanticTokens/full", "params": map[string]any{"textDocument": map[string]any{"uri": uri}}},
+		map[string]any{"method": "exit"})
+	b, _ := json.Marshal(find(res, 2)["result"])
+	if !strings.Contains(string(b), `"data":[`) || len(b) < 50 {
+		t.Errorf("expected non-empty semantic tokens, got %s", b)
+	}
+}
+

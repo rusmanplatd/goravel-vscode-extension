@@ -13,8 +13,10 @@ func main() {
 		cat := indexer.Build(os.Args[2])
 		for _, n := range cat.TableNames() {
 			t := cat.Table(n)
-			fmt.Printf("%s (%s) cols=%d\n", t.Name, t.Model, len(t.Columns))
+			fmt.Printf("%s (%s) cols=%d rels=%d\n", t.Name, t.Model, len(t.Columns), len(t.Relations))
 		}
+		fmt.Printf("\nSummary: %d tables, %d routes, %d configs, %d rules, %d migrations\n",
+			len(cat.Tables), len(cat.Routes), len(cat.Configs), len(cat.Rules), len(cat.Migrations))
 		return
 	}
 	if len(os.Args) > 2 && os.Args[1] == "--check" {

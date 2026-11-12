@@ -4,7 +4,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
+	"io/fs"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -19,24 +19,30 @@ type parsedFile struct {
 	file *ast.File
 }
 
-func indexModels(c *Catalog, root string) {
-	dir := filepath.Join(root, "app", "models")
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return
-	}
+func walkGoFiles(dir string) []*parsedFile {
 	var files []*parsedFile
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".go") || strings.HasSuffix(e.Name(), "_test.go") {
-			continue
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
 		}
-		p := filepath.Join(dir, e.Name())
+		if !strings.HasSuffix(d.Name(), ".go") || strings.HasSuffix(d.Name(), "_test.go") {
+			return nil
+		}
 		fset := token.NewFileSet()
 		f, err := parser.ParseFile(fset, p, nil, parser.ParseComments)
 		if err != nil || f == nil {
-			continue
+			return nil
 		}
 		files = append(files, &parsedFile{p, fset, f})
+		return nil
+	})
+	return files
+}
+
+func indexModels(c *Catalog, root string) {
+	files := walkGoFiles(filepath.Join(root, "app", "models"))
+	if len(files) == 0 {
+		return
 	}
 
 	// 1. string constants (OriginalTableName values etc.)
@@ -100,10 +106,10 @@ func indexModels(c *Catalog, root string) {
 				if !ok {
 					continue
 				}
-				c.Structs[ts.Name.Name] = structInfo(ts.Name.Name, st)
+				c.Structs[ts.Name.Name] = structInfo(pf, ts.Name.Name, st, ts.Name.Pos())
 				tname, has := tableOf[ts.Name.Name]
 				if !has {
-					continue // not a table model (e.g. *Row scan structs are handled below)
+					continue // not a table model (e.g. *Row scan structs or base structs)
 				}
 				t := c.ensure(tname)
 				t.Model = ts.Name.Name
@@ -117,8 +123,44 @@ func indexModels(c *Catalog, root string) {
 	}
 }
 
+func indexRequests(c *Catalog, root string) {
+	files := walkGoFiles(filepath.Join(root, "app", "http", "requests"))
+	for _, pf := range files {
+		for _, d := range pf.file.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, s := range gd.Specs {
+				ts := s.(*ast.TypeSpec)
+				st, ok := ts.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+				c.Structs[ts.Name.Name] = structInfo(pf, ts.Name.Name, st, ts.Name.Pos())
+			}
+		}
+	}
+}
+
+func addEmbeddedColumns(t *Table, pf *parsedFile, pos token.Pos, embedType string) {
+	l := loc(pf, pos)
+	switch embedType {
+	case "orm.Model", "Model":
+		t.add(&Column{Name: "id", GoName: "ID", GoType: "uint", SQLType: "BIGINT", Nullable: false, Loc: l})
+		t.add(&Column{Name: "created_at", GoName: "CreatedAt", GoType: "carbon.DateTime", SQLType: "TIMESTAMP", Nullable: true, Loc: l})
+		t.add(&Column{Name: "updated_at", GoName: "UpdatedAt", GoType: "carbon.DateTime", SQLType: "TIMESTAMP", Nullable: true, Loc: l})
+	case "orm.SoftDeletes", "SoftDeletes", "gorm.DeletedAt":
+		t.add(&Column{Name: "deleted_at", GoName: "DeletedAt", GoType: "*time.Time", SQLType: "TIMESTAMP", Nullable: true, Loc: l})
+	case "orm.Timestamps", "Timestamps":
+		t.add(&Column{Name: "created_at", GoName: "CreatedAt", GoType: "time.Time", SQLType: "TIMESTAMP", Nullable: true, Loc: l})
+		t.add(&Column{Name: "updated_at", GoName: "UpdatedAt", GoType: "time.Time", SQLType: "TIMESTAMP", Nullable: true, Loc: l})
+	}
+}
+
 func addFields(t *Table, pf *parsedFile, f *ast.Field) {
 	if len(f.Names) == 0 {
+		addEmbeddedColumns(t, pf, f.Pos(), strings.TrimPrefix(exprString(f.Type), "*"))
 		return
 	}
 	tag := reflect.StructTag("")
@@ -128,7 +170,25 @@ func addFields(t *Table, pf *parsedFile, f *ast.Field) {
 		}
 	}
 	gormTag := tag.Get("gorm")
-	if gormTag == "-" || strings.Contains(gormTag, "foreignKey") || strings.Contains(gormTag, "many2many") || strings.Contains(gormTag, "polymorphic") {
+	if gormTag == "-" {
+		return
+	}
+	fk, refs := parseGormRelTags(gormTag)
+	goType := exprString(f.Type)
+	baseType := cleanModelType(goType)
+
+	if strings.Contains(gormTag, "foreignKey") || strings.Contains(gormTag, "many2many") || strings.Contains(gormTag, "polymorphic") {
+		for _, n := range f.Names {
+			if n.IsExported() {
+				t.addRelation(&Relation{
+					Name:        n.Name,
+					TargetModel: baseType,
+					ForeignKey:  Snake(fk),
+					References:  Snake(refs),
+					Loc:         loc(pf, n.Pos()),
+				})
+			}
+		}
 		return
 	}
 	jsonName := strings.Split(tag.Get("json"), ",")[0]
@@ -151,8 +211,6 @@ func addFields(t *Table, pf *parsedFile, f *ast.Field) {
 		if col == "" {
 			col = Snake(n.Name)
 		}
-		_ = jsonName
-		goType := exprString(f.Type)
 		doc := ""
 		if f.Doc != nil {
 			doc = cleanDoc(f.Doc.Text())
@@ -162,9 +220,127 @@ func addFields(t *Table, pf *parsedFile, f *ast.Field) {
 			GoName:   n.Name,
 			GoType:   goType,
 			Doc:      doc,
-			Nullable: strings.HasPrefix(goType, "*"),
+			Nullable: strings.HasPrefix(goType, "*") || strings.Contains(goType, "Null"),
 			Loc:      loc(pf, n.Pos()),
 		})
+	}
+}
+
+func parseGormRelTags(gormTag string) (fk, refs string) {
+	for _, part := range strings.Split(gormTag, ";") {
+		part = strings.TrimSpace(part)
+		switch {
+		case strings.HasPrefix(part, "foreignKey:"):
+			fk = strings.TrimPrefix(part, "foreignKey:")
+		case strings.HasPrefix(part, "references:"):
+			refs = strings.TrimPrefix(part, "references:")
+		}
+	}
+	return
+}
+
+func cleanModelType(goType string) string {
+	t := strings.TrimLeft(goType, "[]*")
+	if i := strings.LastIndex(t, "."); i >= 0 {
+		t = t[i+1:]
+	}
+	return t
+}
+
+// resolveModelRelations links relation fields on models (including implicit struct/slice fields)
+// to their target tables and foreign keys, and merges embedded struct fields.
+func resolveModelRelations(c *Catalog) {
+	for modelName, t := range c.Models {
+		si := c.Structs[modelName]
+		if si != nil {
+			for _, emb := range si.Embeds {
+				if esi := c.Structs[emb]; esi != nil {
+					for _, ef := range esi.Fields {
+						t.add(&Column{
+							Name:     ef.Col,
+							GoName:   ef.GoName,
+							GoType:   ef.GoType,
+							Nullable: strings.HasPrefix(ef.GoType, "*"),
+							Loc:      ef.Loc,
+						})
+					}
+				}
+			}
+			for _, sf := range si.Fields {
+				target := c.Models[sf.Relation]
+				if target == nil {
+					continue
+				}
+				fk := Snake(sf.FK)
+				if fk == "" {
+					cand := Snake(sf.GoName) + "_id"
+					if t.Column(cand) != nil {
+						fk = cand
+					} else if target.Column(Snake(modelName)+"_id") != nil {
+						fk = Snake(modelName) + "_id"
+					}
+				}
+				refs := Snake(sf.Refs)
+				if refs == "" {
+					refs = "id"
+				}
+				t.addRelation(&Relation{
+					Name:        sf.GoName,
+					TargetModel: target.Model,
+					TargetTable: target.Name,
+					ForeignKey:  fk,
+					References:  refs,
+					Loc:         sf.Loc,
+				})
+			}
+		}
+		for _, r := range t.Relations {
+			if r.TargetTable == "" && r.TargetModel != "" {
+				if target := c.Models[r.TargetModel]; target != nil {
+					r.TargetTable = target.Name
+				}
+			}
+			if r.References == "" {
+				r.References = "id"
+			}
+			if r.ForeignKey == "" && r.Name != "" {
+				cand := Snake(r.Name) + "_id"
+				if t.Column(cand) != nil {
+					r.ForeignKey = cand
+				}
+			}
+			if r.ForeignKey != "" && r.TargetTable != "" {
+				if col := t.Column(r.ForeignKey); col != nil && col.ForeignKey == "" {
+					col.ForeignKey = r.TargetTable + "." + r.References
+				}
+			}
+		}
+		// Infer FK relations from *_id columns when matching a table name or model suffix
+		for _, col := range t.Columns {
+			if !strings.HasSuffix(col.Name, "_id") || col.ForeignKey != "" {
+				continue
+			}
+			stem := strings.TrimSuffix(col.Name, "_id") // e.g. "province"
+			for _, cand := range c.Tables {
+				if cand == t {
+					continue
+				}
+				if cand.Name == stem+"s" || cand.Name == stem+"es" || strings.HasSuffix(cand.Name, "_"+stem+"s") ||
+					strings.HasSuffix(cand.Name, "_"+stem+"es") || strings.HasSuffix(cand.Name, "_"+ strings.TrimSuffix(stem, "y")+"ies") ||
+					strings.EqualFold(cand.Model, stem) || strings.HasSuffix(strings.ToLower(cand.Model), stem) {
+					col.ForeignKey = cand.Name + ".id"
+					t.addRelation(&Relation{
+						Name:        strings.TrimSuffix(col.GoName, "ID"),
+						TargetModel: cand.Model,
+						TargetTable: cand.Name,
+						ForeignKey:  col.Name,
+						References:  "id",
+						Loc:         col.Loc,
+					})
+					break
+				}
+			}
+		}
 	}
 }
 
@@ -232,9 +408,13 @@ func Snake(s string) string {
 	return b.String()
 }
 
-func structInfo(name string, st *ast.StructType) *StructInfo {
-	si := &StructInfo{Name: name}
+func structInfo(pf *parsedFile, name string, st *ast.StructType, pos token.Pos) *StructInfo {
+	si := &StructInfo{Name: name, Loc: loc(pf, pos)}
 	for _, f := range st.Fields.List {
+		if len(f.Names) == 0 {
+			si.Embeds = append(si.Embeds, cleanModelType(exprString(f.Type)))
+			continue
+		}
 		tag := reflect.StructTag("")
 		if f.Tag != nil {
 			if u, err := strconv.Unquote(f.Tag.Value); err == nil {
@@ -244,19 +424,42 @@ func structInfo(name string, st *ast.StructType) *StructInfo {
 		if tag.Get("db") == "-" {
 			continue
 		}
+		gormTag := tag.Get("gorm")
+		fk, refs := parseGormRelTags(gormTag)
+		goType := exprString(f.Type)
+		baseType := cleanModelType(goType)
 		for _, n := range f.Names {
 			if !n.IsExported() {
 				continue
 			}
 			col := strings.Split(tag.Get("db"), ",")[0]
 			if col == "" {
-				col = Snake(n.Name)
+				if j := strings.Split(tag.Get("json"), ",")[0]; j != "" && j != "-" {
+					col = j
+				} else if fm := strings.Split(tag.Get("form"), ",")[0]; fm != "" && fm != "-" {
+					col = fm
+				} else {
+					col = Snake(n.Name)
+				}
 			}
 			alts := []string{strings.ToLower(n.Name), Snake(n.Name)}
 			if j := strings.Split(tag.Get("json"), ",")[0]; j != "" && j != "-" {
 				alts = append(alts, j)
 			}
-			si.Fields = append(si.Fields, StructField{Col: col, Alt: alts, GoName: n.Name, GoType: exprString(f.Type)})
+			if fm := strings.Split(tag.Get("form"), ",")[0]; fm != "" && fm != "-" {
+				alts = append(alts, fm)
+			}
+			sf := StructField{
+				Col:      col,
+				Alt:      alts,
+				GoName:   n.Name,
+				GoType:   goType,
+				Relation: baseType,
+				FK:       fk,
+				Refs:     refs,
+				Loc:      loc(pf, n.Pos()),
+			}
+			si.Fields = append(si.Fields, sf)
 		}
 	}
 	return si
