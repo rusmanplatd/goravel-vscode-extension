@@ -48,3 +48,8 @@ jobs:
 
       - name: Publish to VS Code Marketplace
         run: npx vsce publish --oidc --packagePath goravel-vscode-*.vsix
+
+      - name: Publish to Open VSX
+        run: npx --yes ovsx publish --packagePath goravel-vscode-*.vsix
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
