@@ -1,22 +1,13 @@
 {
   "scopeName": "goravel-sql.injection",
-  "injectionSelector": "L:source.go string.quoted.raw.go, L:source.go string.quoted.double.go",
+  "injectionSelector": "R:source.go string.quoted.raw.go, R:source.go string.quoted.double.go",
   "patterns": [
-    { "include": "#sql-raw-block" },
-    { "include": "#sql-double-block" }
+    { "include": "#sql-block" }
   ],
   "repository": {
-    "sql-raw-block": {
-      "begin": "(?i)(?=\\s*(?:--|/\\*|SELECT|INSERT\\s+INTO|UPDATE|DELETE\\s+FROM|WITH|CREATE\\s+(?:TABLE|INDEX|UNIQUE\\s+INDEX|POLICY|OR\\s+REPLACE|VIEW|SCHEMA|EXTENSION|TRIGGER|FUNCTION)|ALTER\\s+TABLE|DROP\\s+(?:TABLE|INDEX|POLICY|VIEW|TRIGGER|FUNCTION)|TRUNCATE|FROM|LEFT\\s+(?:OUTER\\s+)?JOIN|RIGHT\\s+(?:OUTER\\s+)?JOIN|INNER\\s+JOIN|FULL\\s+(?:OUTER\\s+)?JOIN|CROSS\\s+JOIN|JOIN|WHERE|AND|OR|ON|ORDER\\s+BY|GROUP\\s+BY|HAVING|LIMIT|OFFSET|VALUES|SET|RETURNING|UNION|[A-Za-z_]\\w*\\s+(?:ON|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|JOIN|WHERE|SET)\\b|[A-Za-z_]\\w*\\s*$))",
-      "end": "(?=`)",
-      "contentName": "meta.embedded.block.sql",
-      "patterns": [
-        { "include": "#sql-tokens" }
-      ]
-    },
-    "sql-double-block": {
-      "begin": "(?i)(?=\\s*(?:SELECT\\b|INSERT\\s+INTO\\b|UPDATE\\s+\\S+\\s+SET\\b|DELETE\\s+FROM\\b|WITH\\b|CREATE\\s+(?:TABLE|INDEX|UNIQUE\\s+INDEX|POLICY)|ALTER\\s+TABLE|DROP\\s+TABLE|FROM\\s+|LEFT\\s+(?:OUTER\\s+)?JOIN\\b|RIGHT\\s+(?:OUTER\\s+)?JOIN\\b|INNER\\s+JOIN\\b|JOIN\\s+|WHERE\\s+|AND\\s+[A-Za-z_(]|OR\\s+[A-Za-z_(]|ORDER\\s+BY\\b|GROUP\\s+BY\\b|HAVING\\s+|LIMIT\\s+|OFFSET\\s+|VALUES\\s*\\(|SET\\s+[A-Za-z_]|RETURNING\\b|[A-Za-z_]\\w*\\s+(?:ON|LEFT\\s+JOIN|INNER\\s+JOIN|JOIN|WHERE)\\b|\\(?[A-Za-z_][\\w.]*\\s+(?:ILIKE|LIKE|IS\\s+(?:NOT\\s+)?NULL|IN\\s*\\()|[A-Za-z_][\\w.]*\\s*(?:=|!=|<>|<=|>=|<|>)\\s*(?:\\$\\d+|\\$%[dsv]|\\?)))",
-      "end": "(?=\")",
+    "sql-block": {
+      "begin": "(?i)(?=\\s*(?:SELECT\\b|INSERT\\s+INTO\\b|UPDATE\\s+[A-Za-z_][\\w.]*\\s+SET\\b|DELETE\\s+FROM\\b|WITH\\s+[A-Za-z_]\\w*\\s+AS\\s*\\(|CREATE\\s+(?:TABLE|INDEX|UNIQUE\\s+INDEX|POLICY|OR\\s+REPLACE|VIEW|SCHEMA|EXTENSION|TRIGGER|FUNCTION)\\b|ALTER\\s+TABLE\\b|DROP\\s+(?:TABLE|INDEX|POLICY|VIEW|TRIGGER|FUNCTION)\\b|TRUNCATE\\s+(?:TABLE\\s+)?[A-Za-z_]|FROM\\s+[A-Za-z_]|(?:LEFT|RIGHT|INNER|FULL|CROSS)(?:\\s+OUTER)?\\s+JOIN\\b|JOIN\\s+[A-Za-z_]|WHERE\\s+[A-Za-z_(]|AND\\s+[A-Za-z_(]|OR\\s+[A-Za-z_(]|ON\\s+[A-Za-z_(]|ORDER\\s+BY\\b|GROUP\\s+BY\\b|HAVING\\s+[A-Za-z_(]|LIMIT\\s+(?:\\$|\\d)|OFFSET\\s+(?:\\$|\\d)|VALUES\\s*\\(|SET\\s+[A-Za-z_]\\w*\\s*=|RETURNING\\b|UNION\\s+(?:ALL\\s+)?SELECT\\b|[A-Za-z_]\\w*\\s+(?:ON|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|JOIN|WHERE)\\b|\\(?[A-Za-z_][\\w.]*\\s+(?:ILIKE|LIKE|IS\\s+(?:NOT\\s+)?NULL|IN\\s*\\()|[A-Za-z_][\\w.]*\\s*(?:=|!=|<>|<=|>=|<|>)\\s*(?:\\$\\d+|\\$%[dsv]|\\?)))",
+      "end": "(?=`|(?<!\\\\)\")",
       "contentName": "meta.embedded.block.sql",
       "patterns": [
         { "include": "#sql-tokens" }
@@ -58,7 +49,7 @@
           }
         },
         {
-          "match": "(?i)(?:(?<=`)|^)\\s*(?!SELECT\\b|FROM\\b|WHERE\\b|LEFT\\b|RIGHT\\b|INNER\\b|OUTER\\b|FULL\\b|CROSS\\b|JOIN\\b|ON\\b|AND\\b|OR\\b|ORDER\\b|GROUP\\b|HAVING\\b|LIMIT\\b|OFFSET\\b|INSERT\\b|UPDATE\\b|DELETE\\b|SET\\b|VALUES\\b|RETURNING\\b|WITH\\b|CREATE\\b|ALTER\\b|DROP\\b)([A-Za-z_]\\w*)\\b(?=\\s*(?:$|\\b(?:ON|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|JOIN|WHERE|ORDER|GROUP|LIMIT|SET)\\b))",
+          "match": "(?i)(?:(?<=`)|^)\\s*(?!SELECT\\b|FROM\\b|WHERE\\b|LEFT\\b|RIGHT\\b|INNER\\b|OUTER\\b|FULL\\b|CROSS\\b|JOIN\\b|ON\\b|AND\\b|OR\\b|ORDER\\b|GROUP\\b|HAVING\\b|LIMIT\\b|OFFSET\\b|INSERT\\b|UPDATE\\b|DELETE\\b|SET\\b|VALUES\\b|RETURNING\\b|WITH\\b|CREATE\\b|ALTER\\b|DROP\\b)([A-Za-z_]\\w*)\\b(?=\\s*\\b(?:ON|LEFT|RIGHT|INNER|OUTER|FULL|CROSS|JOIN|WHERE)\\b)",
           "captures": {
             "1": { "name": "entity.name.type.sql" }
           }
