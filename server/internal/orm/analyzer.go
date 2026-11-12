@@ -30,6 +30,7 @@ const (
 	SpanEnvKey                      // config.Env("JWT_SECRET")
 	SpanRuleField                   // map key in Rules(ctx)
 	SpanRuleValue                   // map value in Rules(ctx) ("required|integer|min:1")
+	SpanRouteParam                  // ctx.Request().Route("id")
 )
 
 // Span represents a string literal in a Go file with Goravel framework semantics.
@@ -41,20 +42,24 @@ type Span struct {
 	Text       string
 	Table      *indexer.Table      // resolved table for ORM / Patch spans
 	ReqStruct  *indexer.StructInfo // resolved request struct for Rule spans
+	Routes     []*indexer.RouteItem // matched routes for controller method
 }
 
 // FileAnalysis holds all framework spans extracted from a Go source file.
 type FileAnalysis struct {
-	Path  string
-	Src   []byte
-	Spans []*Span
+	Path       string
+	Src        []byte
+	Spans      []*Span
+	ExtraDiags []rawsql.Diag
 }
 
 var (
-	ormColMethods   = map[string]bool{"Select": true, "Group": true, "Update": true, "Pluck": true, "Omit": true}
-	ormWhereMethods = map[string]bool{"Where": true, "OrWhere": true, "WhereNot": true, "WhereIn": true, "WhereNotIn": true, "WhereBetween": true, "WhereNull": true, "WhereNotNull": true, "Having": true}
-	cfgGetMethods   = map[string]bool{"Get": true, "GetString": true, "GetInt": true, "GetBool": true, "GetDuration": true}
-	identRe         = regexp.MustCompile(`[A-Za-z_]\w*`)
+	ormColMethods     = map[string]bool{"Select": true, "Group": true, "Update": true, "Pluck": true, "Omit": true}
+	ormWhereMethods   = map[string]bool{"Where": true, "OrWhere": true, "WhereNot": true, "WhereIn": true, "WhereNotIn": true, "WhereBetween": true, "WhereNull": true, "WhereNotNull": true, "Having": true}
+	cfgGetMethods     = map[string]bool{"Get": true, "GetString": true, "GetInt": true, "GetBool": true, "GetDuration": true}
+	routeParamMethods = map[string]bool{"Route": true, "RouteInt": true, "RouteInt64": true}
+	swaggerRouterRe   = regexp.MustCompile(`@Router\s+(\S+)\s+\[([a-zA-Z]+)\]`)
+	identRe           = regexp.MustCompile(`[A-Za-z_]\w*`)
 	whereSkipWords  = map[string]bool{
 		"and": true, "or": true, "not": true, "is": true, "null": true, "in": true, "like": true, "ilike": true,
 		"between": true, "exists": true, "true": true, "false": true, "asc": true, "desc": true, "as": true,
@@ -67,7 +72,7 @@ var (
 func AnalyzeFile(path string, src []byte, cat *indexer.Catalog) *FileAnalysis {
 	fa := &FileAnalysis{Path: path, Src: src}
 	fset := token.NewFileSet()
-	f, _ := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
+	f, _ := parser.ParseFile(fset, path, src, parser.ParseComments|parser.SkipObjectResolution)
 	if f == nil {
 		return fa
 	}
@@ -110,6 +115,13 @@ func AnalyzeFile(path string, src []byte, cat *indexer.Catalog) *FileAnalysis {
 			rname = recvTypeName(fd.Recv)
 		}
 		defaultTable := recvTable[rname]
+		var ctrlRoutes []*indexer.RouteItem
+		if rname != "" && fd.Name != nil {
+			ctrlRoutes = cat.RoutesForHandler(rname, fd.Name.Name)
+			if len(ctrlRoutes) > 0 && fd.Doc != nil {
+				checkSwaggerRouter(fa, off, fd.Doc, ctrlRoutes)
+			}
+		}
 
 		// Handle Form Request Rules(ctx) methods
 		if fd.Name.Name == "Rules" && rname != "" {
@@ -218,6 +230,19 @@ func AnalyzeFile(path string, src []byte, cat *indexer.Catalog) *FileAnalysis {
 			if mname == "Env" && len(call.Args) >= 1 && isConfigReceiver(sel.X) {
 				if bl, ok := call.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
 					addLitSpan(fa, off, bl, SpanEnvKey, off(call.End()), nil, nil)
+				}
+				return true
+			}
+
+			// Check ctx.Request().Route("id"), RouteInt("id"), RouteInt64("id")
+			if routeParamMethods[mname] && len(call.Args) >= 1 && len(ctrlRoutes) > 0 && isRequestReceiver(sel.X) {
+				if bl, ok := call.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
+					if raw, err := strconv.Unquote(bl.Value); err == nil {
+						s := off(bl.Pos()) + 1
+						fa.Spans = append(fa.Spans, &Span{
+							Kind: SpanRouteParam, Start: s, End: s + len(raw), Text: raw, Routes: ctrlRoutes,
+						})
+					}
 				}
 				return true
 			}
@@ -587,6 +612,23 @@ func (fa *FileAnalysis) Completion(goOff int, cat *indexer.Catalog) ([]map[strin
 			})
 		}
 		return items, true
+
+	case SpanRouteParam:
+		seen := map[string]bool{}
+		for _, r := range sp.Routes {
+			for _, p := range r.Params {
+				if seen[p] {
+					continue
+				}
+				seen[p] = true
+				items = append(items, map[string]any{
+					"label":  p,
+					"kind":   6,
+					"detail": fmt.Sprintf("Route param (%s %s)", r.Method, r.Path),
+				})
+			}
+		}
+		return items, true
 	}
 	return nil, false
 }
@@ -643,10 +685,25 @@ func (fa *FileAnalysis) Hover(goOff int, cat *indexer.Catalog) (md string, start
 		}
 
 	case SpanRuleValue:
+		if tbl, col, rs, re, ok := ruleDBRefAt(sp.Text, relOff, cat); ok {
+			if col != nil {
+				return colDocMD(tbl, col), sp.Start + rs, sp.Start + re, true
+			}
+			if tbl != nil {
+				return fmt.Sprintf("**Table `%s`** (%d columns)", tbl.Name, len(tbl.Columns)), sp.Start + rs, sp.Start + re, true
+			}
+		}
 		rname, rs, re := ruleSegmentAt(sp.Text, relOff)
 		if ri := cat.Rule(rname); ri != nil {
 			return ruleDocMD(ri), sp.Start + rs, sp.Start + re, true
 		}
+
+	case SpanRouteParam:
+		var lines []string
+		for _, r := range sp.Routes {
+			lines = append(lines, fmt.Sprintf("- `%s %s`", r.Method, r.Path))
+		}
+		return fmt.Sprintf("**Route Parameter `%s`**\n\n%s", sp.Text, strings.Join(lines, "\n")), sp.Start, sp.End, true
 	}
 	return "", 0, 0, false
 }
@@ -697,9 +754,24 @@ func (fa *FileAnalysis) Definition(goOff int, cat *indexer.Catalog) []indexer.Lo
 		}
 
 	case SpanRuleValue:
+		if tbl, col, _, _, ok := ruleDBRefAt(sp.Text, relOff, cat); ok {
+			if col != nil {
+				add(col.Loc)
+				add(col.MigLoc)
+			} else if tbl != nil {
+				add(tbl.Loc)
+				add(tbl.MigLoc)
+			}
+			return locs
+		}
 		rname, _, _ := ruleSegmentAt(sp.Text, relOff)
 		if ri := cat.Rule(rname); ri != nil && ri.Loc.Valid() {
 			add(ri.Loc)
+		}
+
+	case SpanRouteParam:
+		for _, r := range sp.Routes {
+			add(r.Loc)
 		}
 	}
 	return locs
@@ -707,7 +779,7 @@ func (fa *FileAnalysis) Definition(goOff int, cat *indexer.Catalog) []indexer.Lo
 
 // Diagnostics validates ORM columns, relations, patch keys, config keys, and validation rules.
 func (fa *FileAnalysis) Diagnostics(cat *indexer.Catalog) []rawsql.Diag {
-	var out []rawsql.Diag
+	out := append([]rawsql.Diag(nil), fa.ExtraDiags...)
 	for _, sp := range fa.Spans {
 		switch sp.Kind {
 		case SpanORMColumn, SpanPatchKey:
@@ -828,8 +900,57 @@ func (fa *FileAnalysis) Diagnostics(cat *indexer.Catalog) []rawsql.Diag {
 						Start: sp.Start + off, End: sp.Start + off + len(rname), Severity: 2,
 						Message: fmt.Sprintf("Unknown validation rule '%s'", rname),
 					})
+				} else if (rname == "exists" || rname == "unique") && strings.Contains(part, ":") && len(cat.Tables) > 0 {
+					colon := strings.IndexByte(part, ':')
+					argsStr := part[colon+1:]
+					args := strings.Split(argsStr, ",")
+					tname := strings.TrimSpace(args[0])
+					if tname != "" && !strings.Contains(tname, "{") {
+						tbl := cat.Table(tname)
+						if tbl == nil {
+							tStart := sp.Start + off + colon + 1
+							out = append(out, rawsql.Diag{
+								Start: tStart, End: tStart + len(args[0]), Severity: 2,
+								Message: fmt.Sprintf("Table '%s' not found in schema for '%s' rule", tname, rname),
+							})
+						} else if len(args) >= 2 {
+							cname := strings.TrimSpace(args[1])
+							if cname != "" && !strings.EqualFold(cname, "NULL") && !strings.Contains(cname, "{") && tbl.Column(cname) == nil {
+								cStart := sp.Start + off + colon + 1 + len(args[0]) + 1
+								out = append(out, rawsql.Diag{
+									Start: cStart, End: cStart + len(args[1]), Severity: 2,
+									Message: fmt.Sprintf("Column '%s' does not exist on table '%s'", cname, tbl.Name),
+								})
+							}
+						}
+					}
 				}
 				off += plen + 1
+			}
+
+		case SpanRouteParam:
+			found := false
+			var avail []string
+			seen := map[string]bool{}
+			for _, r := range sp.Routes {
+				for _, p := range r.Params {
+					if !seen[p] {
+						seen[p] = true
+						avail = append(avail, p)
+					}
+					if p == sp.Text {
+						found = true
+					}
+				}
+			}
+			if !found && sp.Text != "" {
+				msg := fmt.Sprintf("Route parameter '%s' is not defined in matched route(s)", sp.Text)
+				if len(avail) > 0 {
+					msg += fmt.Sprintf(" (available: %s)", strings.Join(avail, ", "))
+				}
+				out = append(out, rawsql.Diag{
+					Start: sp.Start, End: sp.End, Severity: 2, Message: msg,
+				})
 			}
 		}
 	}
@@ -1029,4 +1150,106 @@ func ruleDocMD(ri *indexer.RuleItem) string {
 		fmt.Fprintf(&b, "- Message: *\"%s\"*\n", ri.Message)
 	}
 	return b.String()
+}
+
+func isRequestReceiver(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "Request"
+}
+
+func normalizeRoutePath(p string) string {
+	parts := strings.Split(strings.TrimSpace(p), "/")
+	for i, seg := range parts {
+		if (strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}")) || strings.HasPrefix(seg, ":") {
+			parts[i] = "{}"
+		}
+	}
+	return "/" + strings.Trim(strings.Join(parts, "/"), "/")
+}
+
+func checkSwaggerRouter(fa *FileAnalysis, off func(token.Pos) int, doc *ast.CommentGroup, routes []*indexer.RouteItem) {
+	for _, c := range doc.List {
+		m := swaggerRouterRe.FindStringSubmatchIndex(c.Text)
+		if m == nil {
+			continue
+		}
+		swPath := c.Text[m[2]:m[3]]
+		swMethod := strings.ToUpper(c.Text[m[4]:m[5]])
+		normSw := normalizeRoutePath(swPath)
+		matched := false
+		for _, r := range routes {
+			if (r.Method == swMethod || r.Method == "ANY") && normalizeRoutePath(r.Path) == normSw {
+				matched = true
+				break
+			}
+		}
+		if !matched {
+			first := routes[0]
+			cOff := off(c.Pos())
+			fa.ExtraDiags = append(fa.ExtraDiags, rawsql.Diag{
+				Start:    cOff + m[0],
+				End:      cOff + m[1],
+				Severity: 3, // Information / Hint-level warning
+				Message:  fmt.Sprintf("@Router %s [%s] does not match registered route %s %s", swPath, strings.ToLower(swMethod), first.Method, first.Path),
+			})
+		}
+	}
+}
+
+func ruleDBRefAt(text string, relOff int, cat *indexer.Catalog) (tbl *indexer.Table, col *indexer.Column, start, end int, ok bool) {
+	if relOff < 0 || relOff > len(text) {
+		return nil, nil, 0, 0, false
+	}
+	segStart := strings.LastIndexByte(text[:relOff], '|') + 1
+	segEnd := len(text)
+	if i := strings.IndexByte(text[relOff:], '|'); i >= 0 {
+		segEnd = relOff + i
+	}
+	seg := text[segStart:segEnd]
+	colon := strings.IndexByte(seg, ':')
+	if colon < 0 {
+		return nil, nil, 0, 0, false
+	}
+	rname := strings.TrimSpace(seg[:colon])
+	if rname != "exists" && rname != "unique" {
+		return nil, nil, 0, 0, false
+	}
+	argsStart := segStart + colon + 1
+	if relOff < argsStart {
+		return nil, nil, 0, 0, false
+	}
+	args := seg[colon+1:]
+	comma := strings.IndexByte(args, ',')
+	tRaw := args
+	if comma >= 0 {
+		tRaw = args[:comma]
+	}
+	tname := strings.TrimSpace(tRaw)
+	tbl = cat.Table(tname)
+	if comma < 0 || relOff <= argsStart+comma {
+		if tbl != nil {
+			return tbl, nil, argsStart, argsStart + len(tRaw), true
+		}
+		return nil, nil, 0, 0, false
+	}
+	colStart := argsStart + comma + 1
+	rest := args[comma+1:]
+	cEndRel := len(rest)
+	if c2 := strings.IndexByte(rest, ','); c2 >= 0 {
+		cEndRel = c2
+	}
+	if relOff > colStart+cEndRel {
+		return nil, nil, 0, 0, false
+	}
+	cname := strings.TrimSpace(rest[:cEndRel])
+	if tbl != nil && cname != "" {
+		if col = tbl.Column(cname); col != nil {
+			return tbl, col, colStart, colStart + cEndRel, true
+		}
+	}
+	return nil, nil, 0, 0, false
 }

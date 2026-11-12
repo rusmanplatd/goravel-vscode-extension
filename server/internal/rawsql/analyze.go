@@ -187,31 +187,45 @@ func (d *Doc) RefAt(v int, sc Scope) *Ref {
 		if v < m[0] || v > m[1] {
 			continue
 		}
-		word := d.Text[m[0]:m[1]]
-		lw := strings.ToLower(word)
-		if m[0] > 0 && d.Text[m[0]-1] == '.' {
-			// qualified column: find qualifier
-			qs := m[0] - 1
-			qe := qs
-			for qs > 0 && (isWord(d.Text[qs-1])) {
-				qs--
-			}
-			if t := sc[strings.ToLower(d.Text[qs:qe])]; t != nil {
-				if c := t.Column(word); c != nil {
-					return &Ref{Table: t, Column: c, VStart: m[0], VEnd: m[1]}
-				}
-			}
-			return nil
+		return d.refForMatch(m[0], m[1], sc)
+	}
+	return nil
+}
+
+// Refs returns all resolved table and column references in the virtual SQL document.
+func (d *Doc) Refs(sc Scope) []*Ref {
+	var out []*Ref
+	for _, m := range wordRe.FindAllStringIndex(d.Text, -1) {
+		if r := d.refForMatch(m[0], m[1], sc); r != nil {
+			out = append(out, r)
 		}
-		if t := sc[lw]; t != nil {
-			return &Ref{Table: t, VStart: m[0], VEnd: m[1]}
+	}
+	return out
+}
+
+func (d *Doc) refForMatch(s, e int, sc Scope) *Ref {
+	word := d.Text[s:e]
+	lw := strings.ToLower(word)
+	if s > 0 && d.Text[s-1] == '.' {
+		qs := s - 1
+		qe := qs
+		for qs > 0 && isWord(d.Text[qs-1]) {
+			qs--
 		}
-		for _, t := range sc.Tables() {
+		if t := sc[strings.ToLower(d.Text[qs:qe])]; t != nil {
 			if c := t.Column(word); c != nil {
-				return &Ref{Table: t, Column: c, VStart: m[0], VEnd: m[1]}
+				return &Ref{Table: t, Column: c, VStart: s, VEnd: e}
 			}
 		}
 		return nil
+	}
+	if t := sc[lw]; t != nil {
+		return &Ref{Table: t, VStart: s, VEnd: e}
+	}
+	for _, t := range sc.Tables() {
+		if c := t.Column(word); c != nil {
+			return &Ref{Table: t, Column: c, VStart: s, VEnd: e}
+		}
 	}
 	return nil
 }

@@ -3,10 +3,11 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { LanguageClient, LanguageClientOptions, ServerOptions } from "vscode-languageclient/node";
 import { registerArtisanCommands } from "./commands/artisan";
-import { MigrationsTreeProvider, ModelsTreeProvider, OverviewData, RoutesTreeProvider } from "./views/explorers";
+import { CommandInfo, MigrationsTreeProvider, ModelsTreeProvider, OverviewData, RoutesTreeProvider } from "./views/explorers";
 
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem | undefined;
+let customCommands: CommandInfo[] = [];
 const modelsProvider = new ModelsTreeProvider();
 const routesProvider = new RoutesTreeProvider();
 const migrationsProvider = new MigrationsTreeProvider();
@@ -27,6 +28,7 @@ async function refreshOverview() {
     modelsProvider.setData(data.tables || []);
     routesProvider.setData(data.routes || []);
     migrationsProvider.setData(data.migrations || []);
+    customCommands = data.commands || [];
     if (statusBar) {
       const nt = data.tables?.length || 0;
       const nr = data.routes?.length || 0;
@@ -55,7 +57,7 @@ async function start(ctx: vscode.ExtensionContext) {
     },
     synchronize: {
       fileEvents: vscode.workspace.createFileSystemWatcher(
-        "**/{app/models,app/rules,app/http/controllers,app/http/requests,config,routes,database/migrations*}/**/*.go"
+        "**/{app/models,app/rules,app/console/commands,app/http/controllers,app/http/requests,config,routes,database/migrations*}/**/*.go"
       ),
     },
   };
@@ -82,7 +84,7 @@ export async function activate(ctx: vscode.ExtensionContext) {
     vscode.window.registerTreeDataProvider("goravel.views.migrations", migrationsProvider)
   );
 
-  registerArtisanCommands(ctx);
+  registerArtisanCommands(ctx, () => customCommands);
 
   ctx.subscriptions.push(
     vscode.commands.registerCommand("goravel.restartServer", async () => {
@@ -99,6 +101,29 @@ export async function activate(ctx: vscode.ExtensionContext) {
     vscode.commands.registerCommand("goravel.jumpToRoute", async (uri: string, line: number, col: number) => {
       await openFileAt(uri, line, col);
     }),
+    vscode.commands.registerCommand(
+      "goravel.route.testRequest",
+      async (route: { method: string; path: string; controller?: string; action?: string }) => {
+        const method = (route.method === "ANY" ? "GET" : route.method) || "GET";
+        const urlPath = (route.path || "/").replace(/\{([^}]+)\}/g, "{{$1}}");
+        const lines = [
+          `### ${route.controller ? `${route.controller}.${route.action}` : `${method} ${route.path}`}`,
+          `@host = http://localhost:3000`,
+          `@token = `,
+          ``,
+          `${method} {{host}}${urlPath}`,
+          `Authorization: Bearer {{token}}`,
+        ];
+        if (method === "POST" || method === "PUT" || method === "PATCH") {
+          lines.push(`Content-Type: application/json`, ``, `{`, `  `, `}`);
+        }
+        const doc = await vscode.workspace.openTextDocument({
+          language: "http",
+          content: lines.join("\n") + "\n",
+        });
+        await vscode.window.showTextDocument(doc, { preview: true });
+      }
+    ),
     vscode.commands.registerCommand("goravel.explainQuery", async (sql: string) => {
       if (!client) return;
       const res = await client.sendRequest<{ ok: boolean; output: string; error?: string }>("goravel/explainQuery", { sql });

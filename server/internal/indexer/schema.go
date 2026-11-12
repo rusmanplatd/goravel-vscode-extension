@@ -155,12 +155,21 @@ type ConfigItem struct {
 type RouteItem struct {
 	Method     string   `json:"method"`     // GET, POST, PUT, PATCH, DELETE, ANY
 	Path       string   `json:"path"`       // e.g. "/api/geo/cities"
+	Params     []string `json:"params,omitempty"`
 	Handler    string   `json:"handler"`    // e.g. "CityController.Index"
 	Controller string   `json:"controller"` // e.g. "CityController"
 	Action     string   `json:"action"`     // e.g. "Index"
 	Module     string   `json:"module"`     // e.g. "api_geo_app"
 	Loc        Location `json:"loc"`        // route registration line
 	CtrlLoc    Location `json:"ctrlLoc"`    // controller method line
+}
+
+// CommandItem describes a custom Artisan command in app/console/commands/*.go.
+type CommandItem struct {
+	Signature   string   `json:"signature"`
+	Description string   `json:"description"`
+	StructName  string   `json:"structName"`
+	Loc         Location `json:"loc"`
 }
 
 // RuleItem describes a built-in or custom validation rule.
@@ -192,6 +201,7 @@ type Catalog struct {
 	Routes      []*RouteItem                    // all registered routes
 	Rules       map[string]*RuleItem            // by rule signature
 	Migrations  []*MigrationItem                // all migration files
+	Commands    []*CommandItem                  // custom Artisan commands
 	Controllers map[string]map[string]Location  // Controller -> Method -> Location
 }
 
@@ -291,6 +301,19 @@ func (c *Catalog) ensure(name string) *Table {
 	return t
 }
 
+// RoutesForHandler returns all registered routes matching a controller and action.
+func (c *Catalog) RoutesForHandler(controller, action string) []*RouteItem {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	var out []*RouteItem
+	for _, r := range c.Routes {
+		if r.Controller == controller && r.Action == action {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
 // Build indexes the project at root.
 func Build(root string) *Catalog {
 	c := NewCatalog()
@@ -304,6 +327,7 @@ func Build(root string) *Catalog {
 	indexRoutes(c, root)
 	indexRules(c, root)
 	indexRequests(c, root)
+	indexCommands(c, root)
 	indexLiveDBIfEnabled(c, root)
 	return c
 }

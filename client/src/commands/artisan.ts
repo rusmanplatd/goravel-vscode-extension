@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import type { CommandInfo } from "../views/explorers";
 
 const ARTISAN_PRESETS: { label: string; description: string; cmd: string; prompt?: string }[] = [
   { label: "make:model", description: "Create a new Eloquent/GORM model class", cmd: "make:model", prompt: "Model name (e.g. User or GeoCity)" },
@@ -40,11 +41,27 @@ async function promptAndRun(cmd: string, prompt: string) {
   runArtisanInTerminal(`${cmd} ${name.trim()}`);
 }
 
-export function registerArtisanCommands(ctx: vscode.ExtensionContext) {
+export function registerArtisanCommands(
+  ctx: vscode.ExtensionContext,
+  getCustomCommands?: () => CommandInfo[]
+) {
   ctx.subscriptions.push(
+    vscode.commands.registerCommand("goravel.artisan.runCommand", (sig: string) => {
+      if (sig && sig.trim()) {
+        runArtisanInTerminal(sig.trim());
+      }
+    }),
     vscode.commands.registerCommand("goravel.artisan.run", async () => {
+      const customCmds: { label: string; description: string; cmd: string; prompt?: string }[] = (
+        getCustomCommands?.() || []
+      ).map((c) => ({
+        label: `$(terminal) ${c.signature}`,
+        description: c.description || `${c.structName} (app/console/commands)`,
+        cmd: c.signature,
+      }));
       const picked = await vscode.window.showQuickPick(
         [
+          ...customCmds,
           ...ARTISAN_PRESETS,
           { label: "$(terminal) Custom command...", description: "Enter custom artisan arguments", cmd: "__custom__" },
         ],

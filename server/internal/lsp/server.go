@@ -150,6 +150,7 @@ func (s *Server) dispatch(m *message) {
 				"completionProvider": map[string]any{"triggerCharacters": []string{".", " ", "\"", "|", ":", ","}},
 				"hoverProvider":      true,
 				"definitionProvider": true,
+				"referencesProvider": true,
 				"codeActionProvider": true,
 				"codeLensProvider":   map[string]any{"resolveProvider": false},
 				"inlayHintProvider":  true,
@@ -227,6 +228,8 @@ func (s *Server) dispatch(m *message) {
 		s.reply(m.ID, s.codeAction(m.Params))
 	case "textDocument/definition":
 		s.reply(m.ID, s.definition(m.Params))
+	case "textDocument/references":
+		s.reply(m.ID, s.references(m.Params))
 	case "textDocument/codeLens":
 		s.reply(m.ID, s.codeLens(m.Params))
 	case "textDocument/inlayHint":
@@ -250,6 +253,7 @@ func shouldReindex(path string) bool {
 		strings.Contains(path, "/config/") ||
 		strings.Contains(path, "/routes/") ||
 		strings.Contains(path, "/app/rules/") ||
+		strings.Contains(path, "/app/console/commands/") ||
 		strings.Contains(path, "/app/http/controllers/") ||
 		strings.Contains(path, "/app/http/requests/")
 }
@@ -604,12 +608,41 @@ func (s *Server) codeLens(raw json.RawMessage) any {
 			continue
 		}
 		pos := Position{r.CtrlLoc.Line, r.CtrlLoc.Col}
+		lenses = append(lenses,
+			map[string]any{
+				"range": Range{pos, pos},
+				"command": map[string]any{
+					"title":     fmt.Sprintf("$(globe) %s %s", r.Method, r.Path),
+					"command":   "goravel.jumpToRoute",
+					"arguments": []any{pathToURI(r.Loc.File), r.Loc.Line, r.Loc.Col},
+				},
+			},
+			map[string]any{
+				"range": Range{pos, pos},
+				"command": map[string]any{
+					"title":   "$(play) Test Request",
+					"command": "goravel.route.testRequest",
+					"arguments": []any{map[string]any{
+						"method":     r.Method,
+						"path":       r.Path,
+						"controller": r.Controller,
+						"action":     r.Action,
+					}},
+				},
+			},
+		)
+	}
+	for _, cmd := range s.cat.Commands {
+		if !cmd.Loc.Valid() || filepath.Clean(cmd.Loc.File) != path {
+			continue
+		}
+		pos := Position{cmd.Loc.Line, cmd.Loc.Col}
 		lenses = append(lenses, map[string]any{
 			"range": Range{pos, pos},
 			"command": map[string]any{
-				"title":     fmt.Sprintf("$(globe) %s %s", r.Method, r.Path),
-				"command":   "goravel.jumpToRoute",
-				"arguments": []any{pathToURI(r.Loc.File), r.Loc.Line, r.Loc.Col},
+				"title":     fmt.Sprintf("$(terminal) Run artisan %s", cmd.Signature),
+				"command":   "goravel.artisan.runCommand",
+				"arguments": []any{cmd.Signature},
 			},
 		})
 	}
@@ -711,6 +744,7 @@ func (s *Server) overview() any {
 		"migrations": s.cat.Migrations,
 		"configs":    configs,
 		"rules":      rules,
+		"commands":   s.cat.Commands,
 	}
 }
 

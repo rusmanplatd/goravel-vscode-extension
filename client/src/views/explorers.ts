@@ -54,10 +54,18 @@ export interface MigrationInfo {
   loc: Loc;
 }
 
+export interface CommandInfo {
+  signature: string;
+  description: string;
+  structName: string;
+  loc: Loc;
+}
+
 export interface OverviewData {
   tables: TableInfo[];
   routes: RouteInfo[];
   migrations: MigrationInfo[];
+  commands?: CommandInfo[];
 }
 
 function openCmd(loc: Loc | undefined, title = "Open Definition"): vscode.Command | undefined {

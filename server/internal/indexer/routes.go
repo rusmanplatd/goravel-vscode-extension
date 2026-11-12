@@ -140,6 +140,7 @@ func walkRouteBlock(c *Catalog, pf *parsedFile, module, parentPrefix string, ctr
 				c.Routes = append(c.Routes, &RouteItem{
 					Method:     verb,
 					Path:       fullPath,
+					Params:     extractRouteParams(fullPath),
 					Handler:    handler,
 					Controller: ctrl,
 					Action:     action,
@@ -185,9 +186,11 @@ func walkRouteBlock(c *Catalog, pf *parsedFile, module, parentPrefix string, ctr
 					if ctrl != "" {
 						handler = ctrl + "." + rr.act
 					}
+					fullResPath := basePath + rr.suffix
 					c.Routes = append(c.Routes, &RouteItem{
 						Method:     rr.verb,
-						Path:       basePath + rr.suffix,
+						Path:       fullResPath,
+						Params:     extractRouteParams(fullResPath),
 						Handler:    handler,
 						Controller: ctrl,
 						Action:     rr.act,
@@ -201,6 +204,27 @@ func walkRouteBlock(c *Catalog, pf *parsedFile, module, parentPrefix string, ctr
 			return true
 		})
 	}
+}
+
+func extractRouteParams(p string) []string {
+	var params []string
+	seen := map[string]bool{}
+	for _, seg := range strings.Split(p, "/") {
+		name := ""
+		if strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}") && len(seg) > 2 {
+			name = seg[1 : len(seg)-1]
+			if i := strings.IndexByte(name, ':'); i >= 0 {
+				name = name[:i]
+			}
+		} else if strings.HasPrefix(seg, ":") && len(seg) > 1 {
+			name = seg[1:]
+		}
+		if name != "" && !seen[name] {
+			seen[name] = true
+			params = append(params, name)
+		}
+	}
+	return params
 }
 
 func extractChainPrefix(e ast.Expr) string {
