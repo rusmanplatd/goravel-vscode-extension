@@ -42,7 +42,7 @@ var (
 	sqlKeywords  = map[string]bool{}
 	sqlFunctions = map[string]bool{}
 	sqlTypes     = map[string]bool{}
-	semTokRe     = regexp.MustCompile(`'(?:''|[^'])*'|\$\d+|\$%[dsv]|\?|\b\d+(?:\.\d+)?\b|[A-Za-z_]\w*|!=|<>|<=|>=|=|<|>|\*`)
+	semTokRe     = regexp.MustCompile(`'(?:''|[^'])*'|\$__|\$\d+|\$%[dsv]|\?|\b\d+(?:\.\d+)?\b|[A-Za-z_]\w*|!=|<>|<=|>=|=|<|>|\*`)
 )
 
 func init() {
