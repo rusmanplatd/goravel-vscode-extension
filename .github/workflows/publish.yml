@@ -44,19 +44,19 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: goravel-vscode-vsix
-          path: goravel-vscode-*.vsix
+          path: dist/goravel-vscode-*.vsix
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: goravel-vscode-*.vsix
+          files: dist/goravel-vscode-*.vsix
           generate_release_notes: true
 
       - name: Publish to VS Code Marketplace
-        run: npx vsce publish --oidc --packagePath goravel-vscode-*.vsix
+        run: npx vsce publish --oidc --packagePath dist/goravel-vscode-*.vsix
 
       - name: Publish to Open VSX
-        run: npx --yes ovsx publish --packagePath goravel-vscode-*.vsix
+        run: npx --yes ovsx publish --packagePath dist/goravel-vscode-*.vsix
         env:
           OVSX_PAT: ${{ secrets.OVSX_PAT }}
