@@ -2,7 +2,7 @@
   "name": "goravel-vscode",
   "displayName": "Goravel",
   "description": "Goravel tooling: raw SQL LSP, ORM query builder intelligence, Config, Routes, Validation Rules, and Artisan CLI for Go projects",
-  "version": "0.2.0",
+  "version": "0.4.0",
   "publisher": "rusmanplatd",
   "repository": {
     "type": "git",
@@ -65,6 +65,10 @@
         {
           "id": "goravel.views.migrations",
           "name": "Migrations"
+        },
+        {
+          "id": "goravel.views.commands",
+          "name": "Commands, Seeders & Schedules"
         }
       ]
     },
@@ -113,6 +117,14 @@
       {
         "command": "goravel.artisan.migrateRollback",
         "title": "Goravel: Artisan migrate:rollback"
+      },
+      {
+        "command": "goravel.artisan.seedSpecific",
+        "title": "Goravel: Artisan db:seed..."
+      },
+      {
+        "command": "goravel.logs.open",
+        "title": "Goravel: Open storage/logs/goravel.log"
       }
     ],
     "menus": {
@@ -122,8 +134,46 @@
           "when": "view =~ /^goravel\\.views\\./",
           "group": "navigation"
         }
+      ],
+      "explorer/context": [
+        {
+          "command": "goravel.artisan.makeModel",
+          "when": "resourcePath =~ /\\/app\\/models$/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeController",
+          "when": "resourcePath =~ /\\/app\\/http\\/controllers$/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeRequest",
+          "when": "resourcePath =~ /\\/app\\/http\\/requests$/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeRule",
+          "when": "resourcePath =~ /\\/app\\/rules$/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeMigration",
+          "when": "resourcePath =~ /\\/database\\/migrations/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeSeeder",
+          "when": "resourcePath =~ /\\/database\\/seeders$/",
+          "group": "goravel@1"
+        }
       ]
     },
+    "snippets": [
+      {
+        "language": "go",
+        "path": "./snippets/goravel.code-snippets"
+      }
+    ],
     "grammars": [
       {
         "scopeName": "goravel-sql.injection",
@@ -145,7 +195,7 @@
     "test:server": "cd server && go test ./...",
     "typecheck": "tsc --noEmit -p .",
     "vscode:prepublish": "npm run build",
-    "package": "vsce package",
+    "package": "npm run typecheck && npm run test:server && vsce package --out dist/",
     "publish": "vsce publish",
     "publish:patch": "vsce publish patch",
     "publish:minor": "vsce publish minor",

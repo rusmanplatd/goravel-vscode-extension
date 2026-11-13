@@ -83,3 +83,36 @@ func ExplainQuery(c *Catalog, sqlText string) (string, error) {
 	return string(out), nil
 }
 
+// PreviewQuery executes a read-only SELECT query (capped at 20 rows) and returns JSON lines.
+func PreviewQuery(c *Catalog, sqlText string) (string, error) {
+	trimmed := strings.TrimSpace(sqlText)
+	up := strings.ToUpper(trimmed)
+	if !strings.HasPrefix(up, "SELECT") && !strings.HasPrefix(up, "WITH") {
+		return "", fmt.Errorf("preview only supports SELECT or WITH queries")
+	}
+	trimmed = strings.TrimRight(trimmed, "; \t\r\n")
+	host := c.EnvVars["DB_HOST"]
+	port := c.EnvVars["DB_PORT"]
+	db := c.EnvVars["DB_DATABASE"]
+	user := c.EnvVars["DB_USERNAME"]
+	pass := c.EnvVars["DB_PASSWORD"]
+	if host == "" || db == "" || user == "" {
+		return "", fmt.Errorf("DB_HOST/DB_DATABASE/DB_USERNAME not configured in .env")
+	}
+	if port == "" {
+		port = "5432"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	wrapped := fmt.Sprintf("SELECT COALESCE(json_agg(_q), '[]'::json) FROM (%s) AS _q LIMIT 20", trimmed)
+	// Better: cap inner rows before aggregating
+	wrapped = fmt.Sprintf("SELECT COALESCE(json_agg(_r), '[]'::json) FROM (SELECT * FROM (%s) AS _q LIMIT 20) AS _r", trimmed)
+	cmd := exec.CommandContext(ctx, "psql", "-h", host, "-p", port, "-U", user, "-d", db, "-At", "-c", wrapped)
+	cmd.Env = append(os.Environ(), "PGPASSWORD="+pass)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), err
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+

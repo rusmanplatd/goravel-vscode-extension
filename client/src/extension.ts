@@ -3,14 +3,24 @@ import * as path from "path";
 import * as vscode from "vscode";
 import { LanguageClient, LanguageClientOptions, ServerOptions } from "vscode-languageclient/node";
 import { registerArtisanCommands } from "./commands/artisan";
-import { CommandInfo, MigrationsTreeProvider, ModelsTreeProvider, OverviewData, RoutesTreeProvider } from "./views/explorers";
+import {
+  CommandInfo,
+  CommandsTreeProvider,
+  MigrationsTreeProvider,
+  ModelsTreeProvider,
+  OverviewData,
+  RoutesTreeProvider,
+  SeederInfo,
+} from "./views/explorers";
 
 let client: LanguageClient | undefined;
 let statusBar: vscode.StatusBarItem | undefined;
 let customCommands: CommandInfo[] = [];
+let customSeeders: SeederInfo[] = [];
 const modelsProvider = new ModelsTreeProvider();
 const routesProvider = new RoutesTreeProvider();
 const migrationsProvider = new MigrationsTreeProvider();
+const commandsProvider = new CommandsTreeProvider();
 
 function serverPath(ctx: vscode.ExtensionContext): string | undefined {
   const cfg = vscode.workspace.getConfiguration("goravel").get<string>("server.path");
@@ -29,6 +39,13 @@ async function refreshOverview() {
     routesProvider.setData(data.routes || []);
     migrationsProvider.setData(data.migrations || []);
     customCommands = data.commands || [];
+    customSeeders = data.seeders || [];
+    commandsProvider.setData(
+      customCommands,
+      customSeeders,
+      data.schedules || [],
+      data.unregistered || []
+    );
     if (statusBar) {
       const nt = data.tables?.length || 0;
       const nr = data.routes?.length || 0;
@@ -57,7 +74,7 @@ async function start(ctx: vscode.ExtensionContext) {
     },
     synchronize: {
       fileEvents: vscode.workspace.createFileSystemWatcher(
-        "**/{app/models,app/rules,app/console/commands,app/http/controllers,app/http/requests,config,routes,database/migrations*}/**/*.go"
+        "**/{app/models,app/rules,app/console,app/http/controllers,app/http/requests,app/http/middleware,bootstrap,config,routes,database/migrations*,database/seeders,resources/views}/**/*"
       ),
     },
   };
@@ -81,10 +98,15 @@ export async function activate(ctx: vscode.ExtensionContext) {
   ctx.subscriptions.push(
     vscode.window.registerTreeDataProvider("goravel.views.models", modelsProvider),
     vscode.window.registerTreeDataProvider("goravel.views.routes", routesProvider),
-    vscode.window.registerTreeDataProvider("goravel.views.migrations", migrationsProvider)
+    vscode.window.registerTreeDataProvider("goravel.views.migrations", migrationsProvider),
+    vscode.window.registerTreeDataProvider("goravel.views.commands", commandsProvider)
   );
 
-  registerArtisanCommands(ctx, () => customCommands);
+  registerArtisanCommands(
+    ctx,
+    () => customCommands,
+    () => customSeeders
+  );
 
   ctx.subscriptions.push(
     vscode.commands.registerCommand("goravel.restartServer", async () => {
@@ -115,7 +137,19 @@ export async function activate(ctx: vscode.ExtensionContext) {
           `Authorization: Bearer {{token}}`,
         ];
         if (method === "POST" || method === "PUT" || method === "PATCH") {
-          lines.push(`Content-Type: application/json`, ``, `{`, `  `, `}`);
+          let body = "{\n  \n}";
+          if (client && route.controller && route.action) {
+            try {
+              const sample = await client.sendRequest<{ body?: string }>("goravel/routeSample", {
+                controller: route.controller,
+                action: route.action,
+              });
+              if (sample?.body) body = sample.body;
+            } catch {
+              // fallback to empty JSON object
+            }
+          }
+          lines.push(`Content-Type: application/json`, ``, body);
         }
         const doc = await vscode.workspace.openTextDocument({
           language: "http",
@@ -133,6 +167,27 @@ export async function activate(ctx: vscode.ExtensionContext) {
       });
       await vscode.window.showTextDocument(doc, { preview: true });
     }),
+    vscode.commands.registerCommand("goravel.previewQuery", async (sql: string) => {
+      if (!client) return;
+      const res = await client.sendRequest<{ ok: boolean; output: string; error?: string }>("goravel/previewQuery", { sql });
+      if (!res.ok) {
+        vscode.window.showErrorMessage(`Query preview failed: ${res.error || res.output}`);
+        return;
+      }
+      let rows: Record<string, unknown>[] = [];
+      try {
+        rows = JSON.parse(res.output || "[]");
+      } catch {
+        rows = [];
+      }
+      const panel = vscode.window.createWebviewPanel(
+        "goravelQueryPreview",
+        "Goravel Query Preview",
+        vscode.ViewColumn.Beside,
+        { enableScripts: false }
+      );
+      panel.webview.html = renderQueryPreviewHtml(sql, rows);
+    }),
     vscode.workspace.onDidSaveTextDocument(() => {
       setTimeout(() => refreshOverview(), 300);
     })
@@ -143,4 +198,46 @@ export async function activate(ctx: vscode.ExtensionContext) {
 
 export async function deactivate() {
   await client?.stop();
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function renderQueryPreviewHtml(sql: string, rows: Record<string, unknown>[]): string {
+  const cols = rows.length > 0 ? Object.keys(rows[0]) : [];
+  const header = cols.map((c) => `<th>${escapeHtml(c)}</th>`).join("");
+  const body = rows
+    .map(
+      (r) =>
+        `<tr>${cols
+          .map((c) => `<td>${escapeHtml(r[c] === null || r[c] === undefined ? "NULL" : String(r[c]))}</td>`)
+          .join("")}</tr>`
+    )
+    .join("");
+  const table =
+    cols.length > 0
+      ? `<table><thead><tr>${header}</tr></thead><tbody>${body}</tbody></table>`
+      : `<p><em>0 rows returned</em></p>`;
+  return `<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { font-family: var(--vscode-font-family); color: var(--vscode-foreground); padding: 12px; }
+  pre { background: var(--vscode-textBlockQuote-background); padding: 8px; border-radius: 4px; overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; margin-top: 12px; font-size: 12px; }
+  th, td { border: 1px solid var(--vscode-panel-border); padding: 6px 8px; text-align: left; }
+  th { background: var(--vscode-editor-inactiveSelectionBackground); }
+</style>
+</head>
+<body>
+  <h3>Query Preview (${rows.length} row${rows.length === 1 ? "" : "s"}, max 20)</h3>
+  <pre>${escapeHtml(sql)}</pre>
+  ${table}
+</body>
+</html>`;
 }

@@ -5,6 +5,9 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/url"
 	"path/filepath"
@@ -15,6 +18,7 @@ import (
 	"unicode/utf16"
 	"unicode/utf8"
 
+	"github.com/rusmanplatd/goravel-lsp/internal/framework"
 	"github.com/rusmanplatd/goravel-lsp/internal/indexer"
 	"github.com/rusmanplatd/goravel-lsp/internal/orm"
 	"github.com/rusmanplatd/goravel-lsp/internal/rawsql"
@@ -240,6 +244,10 @@ func (s *Server) dispatch(m *message) {
 		s.reply(m.ID, s.overview())
 	case "goravel/explainQuery":
 		s.reply(m.ID, s.explainQuery(m.Params))
+	case "goravel/previewQuery":
+		s.reply(m.ID, s.previewQuery(m.Params))
+	case "goravel/routeSample":
+		s.reply(m.ID, s.routeSample(m.Params))
 	default:
 		if len(m.ID) > 0 && m.Method != "" {
 			s.send(map[string]any{"jsonrpc": "2.0", "id": m.ID, "error": &rpcError{-32601, "method not found: " + m.Method}})
@@ -250,12 +258,16 @@ func (s *Server) dispatch(m *message) {
 func shouldReindex(path string) bool {
 	return strings.Contains(path, "/app/models/") ||
 		strings.Contains(path, "/database/migrations") ||
+		strings.Contains(path, "/database/seeders/") ||
 		strings.Contains(path, "/config/") ||
 		strings.Contains(path, "/routes/") ||
 		strings.Contains(path, "/app/rules/") ||
-		strings.Contains(path, "/app/console/commands/") ||
+		strings.Contains(path, "/app/console/") ||
 		strings.Contains(path, "/app/http/controllers/") ||
-		strings.Contains(path, "/app/http/requests/")
+		strings.Contains(path, "/app/http/requests/") ||
+		strings.Contains(path, "/app/http/middleware/") ||
+		strings.Contains(path, "/bootstrap/") ||
+		strings.Contains(path, "/resources/views/")
 }
 
 func (s *Server) reindex() {
@@ -316,6 +328,15 @@ func (s *Server) completion(raw json.RawMessage) any {
 	fa := orm.AnalyzeFile(path, []byte(text), s.cat)
 	if items, ok := fa.Completion(off, s.cat); ok && len(items) > 0 {
 		return map[string]any{"isIncomplete": false, "items": items}
+	}
+
+	// 1b. Check Form Request keys & View templates
+	if fItems := append(framework.RequestCompletions(path, text, s.cat, off), framework.ViewCompletions(path, text, s.cat, off)...); len(fItems) > 0 {
+		var lspItems []map[string]any
+		for _, it := range fItems {
+			lspItems = append(lspItems, map[string]any{"label": it.Label, "detail": it.Detail, "kind": it.Kind})
+		}
+		return map[string]any{"isIncomplete": false, "items": lspItems}
 	}
 
 	// 2. Check Raw SQL documents
@@ -462,6 +483,17 @@ func (s *Server) hover(raw json.RawMessage) any {
 		}
 	}
 
+	// 1b. Framework hover (Routes/Controllers/Middleware, Views, Schedule Cron)
+	if h := framework.RouteAndControllerHover(path, text, s.cat, off); h != nil {
+		return map[string]any{"contents": map[string]any{"kind": "markdown", "value": h.Markdown}}
+	}
+	if h := framework.ViewHover(path, text, s.cat, off); h != nil {
+		return map[string]any{"contents": map[string]any{"kind": "markdown", "value": h.Markdown}}
+	}
+	if h := framework.ScheduleHover(path, text, off); h != nil {
+		return map[string]any{"contents": map[string]any{"kind": "markdown", "value": h.Markdown}}
+	}
+
 	// 2. Raw SQL hover
 	_, _, _, _, d, v, sc, ok := s.resolve(raw)
 	if !ok {
@@ -500,6 +532,12 @@ func (s *Server) definition(raw json.RawMessage) any {
 	fa := orm.AnalyzeFile(path, []byte(text), s.cat)
 	for _, l := range fa.Definition(off, s.cat) {
 		add(l, 0)
+	}
+	if d := framework.ViewDefinition(path, text, s.cat, off); d != nil {
+		add(d.Loc, 0)
+	}
+	if d := framework.RouteMiddlewareDefinition(path, text, s.cat, off); d != nil {
+		add(d.Loc, 0)
 	}
 	if len(locs) > 0 {
 		return locs
@@ -546,6 +584,17 @@ func (s *Server) diagnose(uri string) {
 				"severity": d.Severity, "source": "goravel", "message": d.Message,
 			})
 		}
+		var fDiags []framework.Diag
+		fDiags = append(fDiags, framework.RequestDiagnostics(path, text, s.cat)...)
+		fDiags = append(fDiags, framework.ControllerDiagnostics(path, text, s.cat)...)
+		fDiags = append(fDiags, framework.ViewDiagnostics(path, text, s.cat)...)
+		fDiags = append(fDiags, framework.DriftDiagnostics(path, text, s.cat)...)
+		for _, d := range fDiags {
+			diags = append(diags, map[string]any{
+				"range":    Range{offsetToPos(text, d.Start), offsetToPos(text, d.End)},
+				"severity": d.Severity, "source": "goravel-framework", "message": d.Message,
+			})
+		}
 	}
 	s.notify("textDocument/publishDiagnostics", map[string]any{"uri": uri, "diagnostics": diags})
 }
@@ -581,14 +630,44 @@ func (s *Server) codeAction(raw json.RawMessage) any {
 		edit("Generate row struct "+name, "refactor.extract", at, at, code)
 	}
 	if d := fi.DocAt(off); d != nil && s.cat.EnvVars["DB_HOST"] != "" {
-		actions = append(actions, map[string]any{
-			"title": "Goravel: Explain SQL Query against DB",
-			"kind":  "quickfix",
-			"command": map[string]any{
-				"title":     "Goravel: Explain SQL Query against DB",
-				"command":   "goravel.explainQuery",
-				"arguments": []any{d.Text},
+		actions = append(actions,
+			map[string]any{
+				"title": "Goravel: Explain SQL Query against DB",
+				"kind":  "quickfix",
+				"command": map[string]any{
+					"title":     "Goravel: Explain SQL Query against DB",
+					"command":   "goravel.explainQuery",
+					"arguments": []any{d.Text},
+				},
 			},
+			map[string]any{
+				"title": "Goravel: Preview Query Results (Live DB)",
+				"kind":  "quickfix",
+				"command": map[string]any{
+					"title":     "Goravel: Preview Query Results (Live DB)",
+					"command":   "goravel.previewQuery",
+					"arguments": []any{d.Text},
+				},
+			},
+		)
+	}
+	path := uriToPath(uri)
+	var fActions []framework.CodeAction
+	fActions = append(fActions, framework.RequestCodeActions(path, text, s.cat, off)...)
+	fActions = append(fActions, framework.ControllerCodeActions(path, text, s.cat, off)...)
+	fActions = append(fActions, framework.DriftCodeActions(path, text, s.cat, off)...)
+	for _, a := range fActions {
+		var changes []map[string]any
+		for _, ed := range a.Edits {
+			changes = append(changes, map[string]any{
+				"range":   Range{offsetToPos(text, ed.Start), offsetToPos(text, ed.End)},
+				"newText": ed.NewText,
+			})
+		}
+		actions = append(actions, map[string]any{
+			"title": a.Title,
+			"kind":  a.Kind,
+			"edit":  map[string]any{"changes": map[string]any{uri: changes}},
 		})
 	}
 	return actions
@@ -646,6 +725,34 @@ func (s *Server) codeLens(raw json.RawMessage) any {
 			},
 		})
 	}
+	if strings.HasSuffix(path, "_test.go") {
+		if text, ok := s.docs[p.TextDocument.URI]; ok {
+			fset := token.NewFileSet()
+			if f, err := parser.ParseFile(fset, path, text, 0); err == nil && f != nil {
+				dir := filepath.Dir(path)
+				for _, d := range f.Decls {
+					fd, ok := d.(*ast.FuncDecl)
+					if !ok || fd.Name == nil || !strings.HasPrefix(fd.Name.Name, "Test") {
+						continue
+					}
+					p0 := fset.Position(fd.Name.Pos())
+					pos := Position{p0.Line - 1, p0.Column - 1}
+					runName := fd.Name.Name
+					if fd.Recv != nil {
+						runName = "/" + runName
+					}
+					lenses = append(lenses, map[string]any{
+						"range": Range{pos, pos},
+						"command": map[string]any{
+							"title":     "$(beaker) Run Goravel Test",
+							"command":   "goravel.test.run",
+							"arguments": []any{dir, runName},
+						},
+					})
+				}
+			}
+		}
+	}
 	return lenses
 }
 
@@ -664,6 +771,14 @@ func (s *Server) inlayHint(raw json.RawMessage) any {
 	fa := orm.AnalyzeFile(uriToPath(uri), []byte(text), s.cat)
 	var hints []map[string]any
 	for _, h := range fa.InlayHints(s.cat) {
+		hints = append(hints, map[string]any{
+			"position":    offsetToPos(text, h.Offset),
+			"label":       h.Label,
+			"kind":        2,
+			"paddingLeft": true,
+		})
+	}
+	for _, h := range framework.ScheduleInlayHints(uriToPath(uri), text) {
 		hints = append(hints, map[string]any{
 			"position":    offsetToPos(text, h.Offset),
 			"label":       h.Label,
@@ -739,12 +854,15 @@ func (s *Server) overview() any {
 		rules = append(rules, s.cat.Rule(r))
 	}
 	return map[string]any{
-		"tables":     tables,
-		"routes":     s.cat.Routes,
-		"migrations": s.cat.Migrations,
-		"configs":    configs,
-		"rules":      rules,
-		"commands":   s.cat.Commands,
+		"tables":       tables,
+		"routes":       s.cat.Routes,
+		"migrations":   s.cat.Migrations,
+		"configs":      configs,
+		"rules":        rules,
+		"commands":     s.cat.Commands,
+		"seeders":      s.cat.Seeders,
+		"schedules":    s.cat.Schedules,
+		"unregistered": s.cat.Unregistered,
 	}
 }
 
@@ -758,6 +876,29 @@ func (s *Server) explainQuery(raw json.RawMessage) any {
 		return map[string]any{"ok": false, "output": out, "error": err.Error()}
 	}
 	return map[string]any{"ok": true, "output": out}
+}
+
+func (s *Server) previewQuery(raw json.RawMessage) any {
+	var p struct {
+		SQL string `json:"sql"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	out, err := indexer.PreviewQuery(s.cat, p.SQL)
+	if err != nil {
+		return map[string]any{"ok": false, "output": out, "error": err.Error()}
+	}
+	return map[string]any{"ok": true, "output": out}
+}
+
+func (s *Server) routeSample(raw json.RawMessage) any {
+	var p struct {
+		Controller string `json:"controller"`
+		Action     string `json:"action"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	return map[string]any{
+		"body": framework.SampleBodyForRoute(s.cat, p.Controller, p.Action),
+	}
 }
 
 // ---- position helpers (LSP uses UTF-16 columns) ----

@@ -17,6 +17,9 @@ var (
 	schemaCreateRe = regexp.MustCompile(`(?s)Schema\(\)\.(?:Connection\([^)]*\)\.)?Create\(\s*(?:"([^"]+)"|(\w+))\s*,\s*func\s*\(\s*(\w+)\s+[^)]+\)\s*\{`)
 	bpColRe        = regexp.MustCompile(`\b(?:table|blueprint)\.(ID|BigIncrements|Increments|Uuid|Ulid|String|Char|Text|MediumText|LongText|Integer|TinyInteger|SmallInteger|MediumInteger|BigInteger|UnsignedInteger|UnsignedBigInteger|Boolean|Decimal|Float|Double|Date|DateTime|DateTimeTz|Time|TimeTz|Timestamp|TimestampTz|Timestamps|TimestampsTz|SoftDeletes|SoftDeletesTz|Json|Jsonb|Binary|Enum|Morphs|NullableMorphs|UuidMorphs|ForeignId|ForeignUuid|ForeignUlid)\s*\(\s*(?:"([^"]+)")?`)
 	bpFkRe         = regexp.MustCompile(`\b(?:table|blueprint)\.Foreign\(\s*"([^"]+)"\s*\)\.References\(\s*"([^"]+)"\s*\)\.On\(\s*"([^"]+)"\s*\)`)
+	bpIdxRe        = regexp.MustCompile(`\b(?:table|blueprint)\.(Index|Unique|Primary)\(\s*([^)]+)\)`)
+	createIdxRe    = regexp.MustCompile("(?is)CREATE\\s+(UNIQUE\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?[\\w.\"]+\\s+ON\\s+(?:`\\s*\\+\\s*(\\w+)\\s*\\+\\s*`|([\\w.\"]+))\\s*\\(([^)]+)\\)")
+	quotedStrRe    = regexp.MustCompile(`"([^"]+)"`)
 	skipWord       = map[string]bool{"constraint": true, "primary": true, "unique": true, "foreign": true, "check": true, "index": true, "key": true, "like": true, "exclude": true}
 )
 
@@ -185,6 +188,20 @@ func parseMigration(c *Catalog, path, src string) string {
 				})
 				continue
 			}
+			if im := bpIdxRe.FindStringSubmatch(line); im != nil {
+				var cols []string
+				for _, q := range quotedStrRe.FindAllStringSubmatch(im[2], -1) {
+					cols = append(cols, q[1])
+				}
+				if len(cols) > 0 {
+					t.Indexes = append(t.Indexes, IndexItem{
+						Columns: cols,
+						Unique:  im[1] == "Unique" || im[1] == "Primary",
+						Loc:     offsetLoc(path, src, lineOff),
+					})
+				}
+				continue
+			}
 			cm := bpColRe.FindStringSubmatchIndex(line)
 			if cm == nil {
 				continue
@@ -228,6 +245,39 @@ func parseMigration(c *Catalog, path, src string) string {
 			}
 		}
 	}
+
+	// 3. Raw SQL CREATE [UNIQUE] INDEX
+	for _, m := range createIdxRe.FindAllStringSubmatchIndex(src, -1) {
+		unique := m[2] >= 0
+		var tname string
+		if m[4] >= 0 {
+			tname = vars[src[m[4]:m[5]]]
+		} else if m[6] >= 0 {
+			tname = src[m[6]:m[7]]
+		}
+		if tname == "" || m[8] < 0 {
+			continue
+		}
+		var cols []string
+		for _, part := range strings.Split(src[m[8]:m[9]], ",") {
+			col := strings.TrimSpace(part)
+			if sp := strings.Fields(col); len(sp) > 0 {
+				col = strings.Trim(sp[0], "\"`")
+			}
+			if col != "" {
+				cols = append(cols, col)
+			}
+		}
+		if len(cols) > 0 {
+			t := c.ensure(tname)
+			t.Indexes = append(t.Indexes, IndexItem{
+				Columns: cols,
+				Unique:  unique,
+				Loc:     offsetLoc(path, src, m[0]),
+			})
+		}
+	}
+
 	return firstTable
 }
 

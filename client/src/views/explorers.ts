@@ -39,6 +39,7 @@ export interface TableInfo {
 export interface RouteInfo {
   method: string;
   path: string;
+  middlewares?: string[];
   handler: string;
   controller: string;
   action: string;
@@ -61,11 +62,34 @@ export interface CommandInfo {
   loc: Loc;
 }
 
+export interface SeederInfo {
+  name: string;
+  signature: string;
+  loc: Loc;
+}
+
+export interface ScheduleInfo {
+  expr: string;
+  human: string;
+  target: string;
+  loc: Loc;
+}
+
+export interface UnregisteredInfo {
+  kind: string;
+  name: string;
+  file: string;
+  loc: Loc;
+}
+
 export interface OverviewData {
   tables: TableInfo[];
   routes: RouteInfo[];
   migrations: MigrationInfo[];
   commands?: CommandInfo[];
+  seeders?: SeederInfo[];
+  schedules?: ScheduleInfo[];
+  unregistered?: UnregisteredInfo[];
 }
 
 function openCmd(loc: Loc | undefined, title = "Open Definition"): vscode.Command | undefined {
@@ -236,6 +260,117 @@ export class MigrationsTreeProvider implements vscode.TreeDataProvider<Migration
     }
     if (el.kind === "folder") {
       return el.items.map((item) => ({ kind: "migration", item }));
+    }
+    return [];
+  }
+}
+
+// ---- Artisan Commands, Seeders, Schedules & Bootstrap Explorer ----
+
+type CommandNode =
+  | { kind: "section"; id: string; label: string; count: number }
+  | { kind: "command"; cmd: CommandInfo }
+  | { kind: "seeder"; seeder: SeederInfo }
+  | { kind: "schedule"; schedule: ScheduleInfo }
+  | { kind: "unregistered"; item: UnregisteredInfo };
+
+export class CommandsTreeProvider implements vscode.TreeDataProvider<CommandNode> {
+  private _onDidChangeTreeData = new vscode.EventEmitter<CommandNode | undefined | void>();
+  readonly onDidChangeTreeData = this._onDidChangeTreeData.event;
+  private commands: CommandInfo[] = [];
+  private seeders: SeederInfo[] = [];
+  private schedules: ScheduleInfo[] = [];
+  private unregistered: UnregisteredInfo[] = [];
+
+  setData(
+    commands: CommandInfo[],
+    seeders: SeederInfo[],
+    schedules: ScheduleInfo[],
+    unregistered: UnregisteredInfo[]
+  ) {
+    this.commands = commands || [];
+    this.seeders = seeders || [];
+    this.schedules = schedules || [];
+    this.unregistered = unregistered || [];
+    this._onDidChangeTreeData.fire();
+  }
+
+  getTreeItem(el: CommandNode): vscode.TreeItem {
+    if (el.kind === "section") {
+      const item = new vscode.TreeItem(
+        el.label,
+        el.count > 0 ? vscode.TreeItemCollapsibleState.Expanded : vscode.TreeItemCollapsibleState.Collapsed
+      );
+      item.description = `${el.count}`;
+      const iconMap: Record<string, string> = {
+        commands: "terminal",
+        seeders: "database",
+        schedules: "clock",
+        unregistered: "warning",
+      };
+      item.iconPath = new vscode.ThemeIcon(iconMap[el.id] || "folder");
+      return item;
+    }
+    if (el.kind === "command") {
+      const c = el.cmd;
+      const item = new vscode.TreeItem(c.signature, vscode.TreeItemCollapsibleState.None);
+      item.description = c.description || c.structName;
+      item.tooltip = `Run: go run . artisan ${c.signature}`;
+      item.iconPath = new vscode.ThemeIcon("play");
+      item.command = {
+        title: `Run ${c.signature}`,
+        command: "goravel.artisan.runCommand",
+        arguments: [c.signature],
+      };
+      return item;
+    }
+    if (el.kind === "seeder") {
+      const s = el.seeder;
+      const item = new vscode.TreeItem(s.signature || s.name, vscode.TreeItemCollapsibleState.None);
+      item.description = s.name;
+      item.tooltip = `Run: go run . artisan db:seed --seeder=${s.signature}`;
+      item.iconPath = new vscode.ThemeIcon("play");
+      item.command = {
+        title: `Run Seeder ${s.signature}`,
+        command: "goravel.artisan.runCommand",
+        arguments: [`db:seed --seeder=${s.signature}`],
+      };
+      return item;
+    }
+    if (el.kind === "schedule") {
+      const sc = el.schedule;
+      const item = new vscode.TreeItem(sc.target || sc.expr, vscode.TreeItemCollapsibleState.None);
+      item.description = sc.human;
+      item.tooltip = `${sc.expr} → ${sc.human}`;
+      item.iconPath = new vscode.ThemeIcon("watch");
+      item.command = openCmd(sc.loc);
+      return item;
+    }
+    const u = el.item;
+    const item = new vscode.TreeItem(u.name, vscode.TreeItemCollapsibleState.None);
+    item.description = `${u.kind} (not in bootstrap/)`;
+    item.iconPath = new vscode.ThemeIcon("info");
+    item.command = openCmd(u.loc);
+    return item;
+  }
+
+  getChildren(el?: CommandNode): CommandNode[] {
+    if (!el) {
+      const sections: CommandNode[] = [
+        { kind: "section", id: "commands", label: "Artisan Commands", count: this.commands.length },
+        { kind: "section", id: "seeders", label: "Database Seeders", count: this.seeders.length },
+        { kind: "section", id: "schedules", label: "Scheduled Tasks", count: this.schedules.length },
+      ];
+      if (this.unregistered.length > 0) {
+        sections.push({ kind: "section", id: "unregistered", label: "Unregistered in bootstrap/", count: this.unregistered.length });
+      }
+      return sections;
+    }
+    if (el.kind === "section") {
+      if (el.id === "commands") return this.commands.map((cmd) => ({ kind: "command", cmd }));
+      if (el.id === "seeders") return this.seeders.map((seeder) => ({ kind: "seeder", seeder }));
+      if (el.id === "schedules") return this.schedules.map((schedule) => ({ kind: "schedule", schedule }));
+      if (el.id === "unregistered") return this.unregistered.map((item) => ({ kind: "unregistered", item }));
     }
     return [];
   }

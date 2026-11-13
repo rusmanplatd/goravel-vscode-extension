@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/rusmanplatd/goravel-lsp/internal/framework"
 	"github.com/rusmanplatd/goravel-lsp/internal/indexer"
 	"github.com/rusmanplatd/goravel-lsp/internal/orm"
 	"github.com/rusmanplatd/goravel-lsp/internal/rawsql"
@@ -34,13 +35,33 @@ func Check(root string) int {
 		fi := rawsql.Extract(p, b, cat)
 		docs += len(fi.Docs)
 		for _, dg := range rawsql.Analyze(fi, cat) {
+			if dg.Severity > 2 {
+				continue
+			}
 			pos := offsetToPos(string(b), dg.Start)
 			fmt.Printf("%s:%d:%d: %s\n", p, pos.Line+1, pos.Character+1, dg.Message)
 			issues++
 		}
 		fa := orm.AnalyzeFile(p, b, cat)
 		for _, dg := range fa.Diagnostics(cat) {
+			if dg.Severity > 2 {
+				continue
+			}
 			pos := offsetToPos(string(b), dg.Start)
+			fmt.Printf("%s:%d:%d: %s\n", p, pos.Line+1, pos.Character+1, dg.Message)
+			issues++
+		}
+		src := string(b)
+		var fDiags []framework.Diag
+		fDiags = append(fDiags, framework.RequestDiagnostics(p, src, cat)...)
+		fDiags = append(fDiags, framework.ControllerDiagnostics(p, src, cat)...)
+		fDiags = append(fDiags, framework.ViewDiagnostics(p, src, cat)...)
+		fDiags = append(fDiags, framework.DriftDiagnostics(p, src, cat)...)
+		for _, dg := range fDiags {
+			if dg.Severity > 2 {
+				continue
+			}
+			pos := offsetToPos(src, dg.Start)
 			fmt.Printf("%s:%d:%d: %s\n", p, pos.Line+1, pos.Character+1, dg.Message)
 			issues++
 		}

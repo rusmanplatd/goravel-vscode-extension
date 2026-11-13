@@ -70,7 +70,7 @@ func indexRoutes(c *Catalog, root string) {
 				}
 				return true
 			})
-			walkRouteBlock(c, pf, module, "", ctrlVars, fd.Body.List)
+			walkRouteBlock(c, pf, module, "", nil, ctrlVars, fd.Body.List)
 		}
 	}
 }
@@ -99,7 +99,7 @@ func extractControllerType(e ast.Expr) string {
 	return ""
 }
 
-func walkRouteBlock(c *Catalog, pf *parsedFile, module, parentPrefix string, ctrlVars map[string]string, stmts []ast.Stmt) {
+func walkRouteBlock(c *Catalog, pf *parsedFile, module, parentPrefix string, parentMws []string, ctrlVars map[string]string, stmts []ast.Stmt) {
 	for _, st := range stmts {
 		ast.Inspect(st, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
@@ -114,7 +114,8 @@ func walkRouteBlock(c *Catalog, pf *parsedFile, module, parentPrefix string, ctr
 			if sel.Sel.Name == "Group" && len(call.Args) > 0 {
 				if fn, ok := call.Args[len(call.Args)-1].(*ast.FuncLit); ok && fn.Body != nil {
 					grpPrefix := joinPath(parentPrefix, extractChainPrefix(sel.X))
-					walkRouteBlock(c, pf, module, grpPrefix, ctrlVars, fn.Body.List)
+					grpMws := mergeMiddlewares(parentMws, extractChainMiddlewares(sel.X))
+					walkRouteBlock(c, pf, module, grpPrefix, grpMws, ctrlVars, fn.Body.List)
 					return false
 				}
 			}
@@ -130,6 +131,7 @@ func walkRouteBlock(c *Catalog, pf *parsedFile, module, parentPrefix string, ctr
 				}
 				chainPrefix := extractChainPrefix(sel.X)
 				fullPath := joinPath(joinPath(parentPrefix, chainPrefix), subPath)
+				mws := mergeMiddlewares(parentMws, extractChainMiddlewares(sel.X))
 				ctrl, action, handler := resolveRouteHandler(call.Args[1], ctrlVars)
 				var ctrlLoc Location
 				if ctrl != "" && action != "" {
@@ -138,15 +140,16 @@ func walkRouteBlock(c *Catalog, pf *parsedFile, module, parentPrefix string, ctr
 					}
 				}
 				c.Routes = append(c.Routes, &RouteItem{
-					Method:     verb,
-					Path:       fullPath,
-					Params:     extractRouteParams(fullPath),
-					Handler:    handler,
-					Controller: ctrl,
-					Action:     action,
-					Module:     module,
-					Loc:        loc(pf, sel.Sel.Pos()),
-					CtrlLoc:    ctrlLoc,
+					Method:      verb,
+					Path:        fullPath,
+					Params:      extractRouteParams(fullPath),
+					Middlewares: mws,
+					Handler:     handler,
+					Controller:  ctrl,
+					Action:      action,
+					Module:      module,
+					Loc:         loc(pf, sel.Sel.Pos()),
+					CtrlLoc:     ctrlLoc,
 				})
 				return false
 			}
@@ -162,6 +165,7 @@ func walkRouteBlock(c *Catalog, pf *parsedFile, module, parentPrefix string, ctr
 				}
 				chainPrefix := extractChainPrefix(sel.X)
 				basePath := joinPath(joinPath(parentPrefix, chainPrefix), subPath)
+				mws := mergeMiddlewares(parentMws, extractChainMiddlewares(sel.X))
 				ctrl := ""
 				if id, ok := call.Args[1].(*ast.Ident); ok {
 					ctrl = ctrlVars[id.Name]
@@ -188,15 +192,16 @@ func walkRouteBlock(c *Catalog, pf *parsedFile, module, parentPrefix string, ctr
 					}
 					fullResPath := basePath + rr.suffix
 					c.Routes = append(c.Routes, &RouteItem{
-						Method:     rr.verb,
-						Path:       fullResPath,
-						Params:     extractRouteParams(fullResPath),
-						Handler:    handler,
-						Controller: ctrl,
-						Action:     rr.act,
-						Module:     module,
-						Loc:        loc(pf, sel.Sel.Pos()),
-						CtrlLoc:    ctrlLoc,
+						Method:      rr.verb,
+						Path:        fullResPath,
+						Params:      extractRouteParams(fullResPath),
+						Middlewares: mws,
+						Handler:     handler,
+						Controller:  ctrl,
+						Action:      rr.act,
+						Module:      module,
+						Loc:         loc(pf, sel.Sel.Pos()),
+						CtrlLoc:     ctrlLoc,
 					})
 				}
 				return false
@@ -245,6 +250,58 @@ func extractChainPrefix(e ast.Expr) string {
 		}
 	}
 	return parent
+}
+
+func extractChainMiddlewares(e ast.Expr) []string {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return nil
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return nil
+	}
+	parent := extractChainMiddlewares(sel.X)
+	if sel.Sel.Name == "Middleware" {
+		var cur []string
+		for _, a := range call.Args {
+			s := cleanMiddlewareExpr(a)
+			if s != "" {
+				cur = append(cur, s)
+			}
+		}
+		return mergeMiddlewares(parent, cur)
+	}
+	return parent
+}
+
+func cleanMiddlewareExpr(e ast.Expr) string {
+	switch x := e.(type) {
+	case *ast.CallExpr:
+		s := exprString(x.Fun)
+		s = strings.TrimPrefix(s, "middleware.")
+		return s
+	case *ast.SelectorExpr:
+		return strings.TrimPrefix(exprString(x), "middleware.")
+	case *ast.Ident:
+		return x.Name
+	}
+	return ""
+}
+
+func mergeMiddlewares(a, b []string) []string {
+	if len(a) == 0 && len(b) == 0 {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range append(append([]string(nil), a...), b...) {
+		if m != "" && !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 func resolveRouteHandler(e ast.Expr, ctrlVars map[string]string) (ctrl, action, handler string) {

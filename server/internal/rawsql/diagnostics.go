@@ -22,7 +22,11 @@ func Analyze(fi *FileInfo, cat *indexer.Catalog) []Diag {
 			g1, ok1 := d.ToGo(is.VStart)
 			g2, ok2 := d.ToGo(is.VEnd)
 			if ok1 && ok2 {
-				out = append(out, Diag{g1, g2, 1, is.Message})
+				sev := is.Severity
+				if sev == 0 {
+					sev = 1
+				}
+				out = append(out, Diag{g1, g2, sev, is.Message})
 			}
 		}
 	}

@@ -68,23 +68,26 @@ flowchart LR
 
 ```text
 goravel-vscode-extension/
-├── package.json                  # Extension manifest, grammars, commands, settings
+├── package.json                  # Extension manifest, grammars, commands, menus, snippets
 ├── tsconfig.json
+├── snippets/
+│   └── goravel.code-snippets     # Go boilerplate snippets (gctrl, greq, gmodel, groute, grule, gcmd, gmig, gtest)
 ├── syntaxes/
 │   └── goravel-sql.injection.tmLanguage.json  # Embedded SQL syntax highlighting in Go
 ├── client/                       # TypeScript VS Code extension client
 │   └── src/
-│       ├── extension.ts          # Activation, LSP client bootstrap, status bar
-│       ├── commands/             # Artisan CLI & code-generation commands
-│       └── views/                # TreeDataProviders for Routes, Models, Migrations
+│       ├── extension.ts          # Activation, LSP client bootstrap, Webview query preview, status bar
+│       ├── commands/             # Artisan CLI, seeder picker, test runner, log viewer
+│       └── views/                # TreeDataProviders for Models, Routes, Migrations, Commands/Seeders/Schedules
 └── server/                       # Go Language Server (goravel-lsp)
     ├── go.mod
     ├── main.go
     └── internal/
-        ├── lsp/                  # JSON-RPC protocol handlers (glsp / go.lsp.dev)
-        ├── indexer/              # Workspace indexer (Models, Migrations, Config, Routes)
+        ├── lsp/                  # JSON-RPC protocol handlers & --check CLI linter
+        ├── indexer/              # Workspace indexer (Models, Migrations, Config, Routes, Views, Seeders, Schedules, Live DB)
         ├── rawsql/               # Raw SQL extractor, Virtual SQL builder, SQL analyzer
-        └── orm/                  # facades.Orm() & facades.DB() call-site analyzer
+        ├── orm/                  # facades.Orm() & facades.DB() call-site analyzer
+        └── framework/            # Form Requests, Route/Swagger sync, Views, Model-Migration drift, Schedules
 ```
 
 ---
@@ -163,8 +166,23 @@ Even when not writing full raw SQL strings, Goravel code passes column and relat
 - Provides autocomplete, hover documentation, and typo diagnostics for Goravel validation rules inside `ctx.Request().Validate(map[string]string{...})` and Form Request `Rules(ctx)` methods (including custom rules registered from `app/rules/*.go`).
 
 ### 5.4. Artisan CLI & Migration Explorer
-- VS Code Command Palette integration for `artisan make:model`, `make:controller`, `make:migration`, `make:seeder`, `make:rule`, `migrate`, `migrate:rollback`.
+- VS Code Command Palette integration for `artisan make:model`, `make:controller`, `make:migration`, `make:seeder`, `make:rule`, `migrate`, `migrate:rollback`, and `db:seed --seeder=...`.
 - **Multi-Folder Migration Explorer**: Supports both standard `database/migrations` and modular migration directories (`database/migrations_geo_app`, `database/migrations_hris_app`, etc. as used in `basegoravel`), with quick navigation between a Model and its corresponding Migrations.
+
+### 5.5. Deep Framework, Views, Drift & DX Tooling (Phase 4)
+- **Form Request ↔ `Rules(ctx)` Sync (`app/http/requests/*.go`)**: Key completions, unknown-key diagnostics, and a *"Generate `Rules(ctx)` entries from struct fields"* Code Action inside `Rules(ctx)`, `Messages(ctx)`, and `Attributes(ctx)`.
+- **Route Params, Middleware & Swagger Sync**:
+  - Validates `ctx.Request().Route(...)` / `RouteInt` / `RouteInt64` against registered route `{param}` placeholders.
+  - Checks `@Router`, `@Param`, and `@Success` Swagger annotations against `facades.Route()` and indexed structs, with a Code Action to generate Swagger comments.
+  - Controller method hover shows route paths and inherited `.Middleware(...)` stacks; middleware names in `routes/` jump to `app/http/middleware/*.go`.
+  - *"Test Request"* CodeLens pre-fills JSON payloads from the controller's bound `requests.*Request` struct (`goravel/routeSample`).
+- **Views & Templates (`resources/views/**/*.tmpl`)**: Completion, hover, Go-to-Definition, missing-template diagnostics, and unused data-key hints on `View().Make(...)`.
+- **Model ↔ Migration Drift & Bootstrap Checks**: Warns on missing migration columns in models (with a Code Action to add them), model fields absent from migrations, and unregistered migrations/seeders/rules/commands not wired into `bootstrap/`.
+- **Schedules, SQL Index Hints & Live Query Preview**:
+  - Human-readable `.Cron("...")` Inlay Hints and Hover cards, plus a **Commands, Seeders & Schedules** sidebar explorer.
+  - Hint diagnostics when `WHERE`/`ON` filters on unindexed columns of indexed tables.
+  - Read-only `SELECT` **Preview Query Results** Webview table (`goravel/previewQuery`, capped at 20 rows).
+- **Testing, Logs, Context Menus & Snippets**: `Test*` CodeLenses in `tests/**/*_test.go` (auto-using `APP_ENV=testing` when `.env.testing` exists), `goravel.logs.open` for `storage/logs/goravel.log`, Explorer right-click `make:*` context menus, and Go snippets (`snippets/goravel.code-snippets`).
 
 ---
 
@@ -191,6 +209,11 @@ Even when not writing full raw SQL strings, Goravel code passes column and relat
 1. Add `facades.Orm().Query()` / `facades.DB().Table()` string argument completions and diagnostics.
 2. Add `facades.Config()` key indexer, completion, hover, and Go-to-Definition.
 3. Add Route indexer, Controller CodeLenses, and Sidebar TreeViews (Routes, Models, Migrations).
+
+### Milestone 5: Deep Framework, Views, Drift & DX Tooling
+1. Add Form Request `Rules(ctx)`/`Messages(ctx)`/`Attributes(ctx)` struct sync, Route `{param}` & Swagger `@Router` validation, Middleware hover/definition, and `.http` sample body generation.
+2. Add View template (`resources/views`) intelligence, Model ↔ Migration drift diagnostics/actions, and `bootstrap/` registration checks.
+3. Add Schedule `.Cron()` inlay hints, SQL index hints, read-only Live DB query preview Webview, Test runner CodeLenses, `Commands, Seeders & Schedules` TreeView, Explorer context menus, and Go snippets.
 
 ---
 

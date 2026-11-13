@@ -40,15 +40,39 @@ type Relation struct {
 	Loc         Location `json:"loc"`
 }
 
+// IndexItem describes a database index on a table.
+type IndexItem struct {
+	Columns []string `json:"columns"`
+	Unique  bool     `json:"unique,omitempty"`
+	Loc     Location `json:"loc,omitempty"`
+}
+
 // Table describes a table and the Go model backing it.
 type Table struct {
 	Name      string      `json:"name"`
 	Model     string      `json:"model"`
 	Columns   []*Column   `json:"columns"`
 	Relations []*Relation `json:"relations,omitempty"`
+	Indexes   []IndexItem `json:"indexes,omitempty"`
 	Loc       Location    `json:"loc"`    // Go struct
 	MigLoc    Location    `json:"migLoc"` // CREATE TABLE
 	byName    map[string]*Column
+}
+
+// HasIndex reports whether col is the leading (or sole) column of an index or is "id".
+func (t *Table) HasIndex(col string) bool {
+	if t == nil {
+		return false
+	}
+	if strings.EqualFold(col, "id") {
+		return true
+	}
+	for _, idx := range t.Indexes {
+		if len(idx.Columns) > 0 && strings.EqualFold(idx.Columns[0], col) {
+			return true
+		}
+	}
+	return false
 }
 
 func (t *Table) Column(name string) *Column {
@@ -153,15 +177,16 @@ type ConfigItem struct {
 
 // RouteItem describes a registered HTTP route in routes/**/*.go.
 type RouteItem struct {
-	Method     string   `json:"method"`     // GET, POST, PUT, PATCH, DELETE, ANY
-	Path       string   `json:"path"`       // e.g. "/api/geo/cities"
-	Params     []string `json:"params,omitempty"`
-	Handler    string   `json:"handler"`    // e.g. "CityController.Index"
-	Controller string   `json:"controller"` // e.g. "CityController"
-	Action     string   `json:"action"`     // e.g. "Index"
-	Module     string   `json:"module"`     // e.g. "api_geo_app"
-	Loc        Location `json:"loc"`        // route registration line
-	CtrlLoc    Location `json:"ctrlLoc"`    // controller method line
+	Method      string   `json:"method"`     // GET, POST, PUT, PATCH, DELETE, ANY
+	Path        string   `json:"path"`       // e.g. "/api/geo/cities"
+	Params      []string `json:"params,omitempty"`
+	Middlewares []string `json:"middlewares,omitempty"`
+	Handler     string   `json:"handler"`    // e.g. "CityController.Index"
+	Controller  string   `json:"controller"` // e.g. "CityController"
+	Action      string   `json:"action"`     // e.g. "Index"
+	Module      string   `json:"module"`     // e.g. "api_geo_app"
+	Loc         Location `json:"loc"`        // route registration line
+	CtrlLoc     Location `json:"ctrlLoc"`    // controller method line
 }
 
 // CommandItem describes a custom Artisan command in app/console/commands/*.go.
@@ -189,31 +214,63 @@ type MigrationItem struct {
 	Loc    Location `json:"loc"`
 }
 
+// SeederItem describes a database seeder in database/seeders.
+type SeederItem struct {
+	Name      string   `json:"name"`
+	Signature string   `json:"signature"`
+	Loc       Location `json:"loc"`
+}
+
+// ScheduleItem describes a scheduled task in app/console or bootstrap.
+type ScheduleItem struct {
+	Expr   string   `json:"expr"`
+	Human  string   `json:"human"`
+	Target string   `json:"target"`
+	Loc    Location `json:"loc"`
+}
+
+// UnregisteredItem describes a migration, seeder, rule, or command not registered in bootstrap/.
+type UnregisteredItem struct {
+	Kind string   `json:"kind"` // migration | seeder | rule | command
+	Name string   `json:"name"`
+	File string   `json:"file"`
+	Loc  Location `json:"loc"`
+}
+
 // Catalog holds all indexed project metadata.
 type Catalog struct {
-	mu          sync.RWMutex
-	Root        string
-	Tables      map[string]*Table               // by table name (no schema)
-	Models      map[string]*Table               // by Go model name
-	Structs     map[string]*StructInfo          // all structs in app/models and app/http/requests
-	Configs     map[string]*ConfigItem          // by dot key (e.g. "jwt.secret")
-	EnvVars     map[string]string               // by env var name from .env*
-	Routes      []*RouteItem                    // all registered routes
-	Rules       map[string]*RuleItem            // by rule signature
-	Migrations  []*MigrationItem                // all migration files
-	Commands    []*CommandItem                  // custom Artisan commands
-	Controllers map[string]map[string]Location  // Controller -> Method -> Location
+	mu                 sync.RWMutex
+	Root               string
+	Tables             map[string]*Table               // by table name (no schema)
+	Models             map[string]*Table               // by Go model name
+	Structs            map[string]*StructInfo          // all structs in app/models and app/http/requests
+	Configs            map[string]*ConfigItem          // by dot key (e.g. "jwt.secret")
+	EnvVars            map[string]string               // by env var name from .env*
+	Routes             []*RouteItem                    // all registered routes
+	Rules              map[string]*RuleItem            // by rule signature
+	Migrations         []*MigrationItem                // all migration files
+	Commands           []*CommandItem                  // custom Artisan commands
+	Controllers        map[string]map[string]Location  // Controller -> Method -> Location
+	Views              map[string]Location             // relative view path (e.g. "auth/signin.tmpl") -> Location
+	Middleware         map[string]Location             // middleware name -> Location
+	Seeders            []*SeederItem                   // database seeders
+	Schedules          []*ScheduleItem                 // scheduled tasks
+	Unregistered       []*UnregisteredItem             // items not wired in bootstrap/
+	UnregisteredByFile map[string]*UnregisteredItem    // file path -> unregistered item
 }
 
 func NewCatalog() *Catalog {
 	c := &Catalog{
-		Tables:      map[string]*Table{},
-		Models:      map[string]*Table{},
-		Structs:     map[string]*StructInfo{},
-		Configs:     map[string]*ConfigItem{},
-		EnvVars:     map[string]string{},
-		Rules:       map[string]*RuleItem{},
-		Controllers: map[string]map[string]Location{},
+		Tables:             map[string]*Table{},
+		Models:             map[string]*Table{},
+		Structs:            map[string]*StructInfo{},
+		Configs:            map[string]*ConfigItem{},
+		EnvVars:            map[string]string{},
+		Rules:              map[string]*RuleItem{},
+		Controllers:        map[string]map[string]Location{},
+		Views:              map[string]Location{},
+		Middleware:         map[string]Location{},
+		UnregisteredByFile: map[string]*UnregisteredItem{},
 	}
 	seedBuiltinRules(c)
 	return c
@@ -328,6 +385,11 @@ func Build(root string) *Catalog {
 	indexRules(c, root)
 	indexRequests(c, root)
 	indexCommands(c, root)
+	indexViews(c, root)
+	indexMiddleware(c, root)
+	indexSeeders(c, root)
+	indexSchedules(c, root)
+	indexBootstrapRegistrations(c, root)
 	indexLiveDBIfEnabled(c, root)
 	return c
 }

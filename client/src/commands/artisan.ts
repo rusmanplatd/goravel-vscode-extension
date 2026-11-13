@@ -1,5 +1,7 @@
+import * as fs from "fs";
+import * as path from "path";
 import * as vscode from "vscode";
-import type { CommandInfo } from "../views/explorers";
+import type { CommandInfo, SeederInfo } from "../views/explorers";
 
 const ARTISAN_PRESETS: { label: string; description: string; cmd: string; prompt?: string }[] = [
   { label: "make:model", description: "Create a new Eloquent/GORM model class", cmd: "make:model", prompt: "Model name (e.g. User or GeoCity)" },
@@ -43,7 +45,8 @@ async function promptAndRun(cmd: string, prompt: string) {
 
 export function registerArtisanCommands(
   ctx: vscode.ExtensionContext,
-  getCustomCommands?: () => CommandInfo[]
+  getCustomCommands?: () => CommandInfo[],
+  getSeeders?: () => SeederInfo[]
 ) {
   ctx.subscriptions.push(
     vscode.commands.registerCommand("goravel.artisan.runCommand", (sig: string) => {
@@ -104,7 +107,56 @@ export function registerArtisanCommands(
       promptAndRun("make:seeder", "Seeder name (e.g. CitySeeder)")
     ),
     vscode.commands.registerCommand("goravel.artisan.migrate", () => runArtisanInTerminal("migrate")),
-    vscode.commands.registerCommand("goravel.artisan.migrateRollback", () => runArtisanInTerminal("migrate:rollback"))
+    vscode.commands.registerCommand("goravel.artisan.migrateRollback", () => runArtisanInTerminal("migrate:rollback")),
+    vscode.commands.registerCommand("goravel.artisan.seedSpecific", async () => {
+      const seeders = getSeeders?.() || [];
+      if (seeders.length === 0) {
+        const name = await vscode.window.showInputBox({
+          title: "Goravel Artisan: db:seed",
+          prompt: "Seeder signature (leave blank to run DatabaseSeeder)",
+        });
+        if (name === undefined) return;
+        runArtisanInTerminal(name.trim() ? `db:seed --seeder=${name.trim()}` : "db:seed");
+        return;
+      }
+      const picked = await vscode.window.showQuickPick(
+        [
+          { label: "$(database) All (db:seed)", description: "Run default DatabaseSeeder", sig: "" },
+          ...seeders.map((s) => ({
+            label: `$(play) ${s.signature}`,
+            description: s.name,
+            sig: s.signature,
+          })),
+        ],
+        { placeHolder: "Select a seeder to run" }
+      );
+      if (!picked) return;
+      runArtisanInTerminal(picked.sig ? `db:seed --seeder=${picked.sig}` : "db:seed");
+    }),
+    vscode.commands.registerCommand("goravel.logs.open", async () => {
+      const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      if (!ws) return;
+      const logPath = path.join(ws, "storage", "logs", "goravel.log");
+      if (!fs.existsSync(logPath)) {
+        vscode.window.showInformationMessage(`Log file not found at ${logPath}`);
+        return;
+      }
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(logPath));
+      const editor = await vscode.window.showTextDocument(doc, { preview: false });
+      const lastLine = Math.max(0, doc.lineCount - 1);
+      const pos = new vscode.Position(lastLine, 0);
+      editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.Default);
+    }),
+    vscode.commands.registerCommand("goravel.test.run", (dir: string, testName: string) => {
+      const term = getTerminal();
+      term.show(true);
+      const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || dir;
+      const hasEnvTesting = fs.existsSync(path.join(ws, ".env.testing"));
+      const envPrefix = hasEnvTesting ? "APP_ENV=testing " : "";
+      const rel = ws ? path.relative(ws, dir) || "." : dir;
+      const pkg = rel.startsWith(".") ? rel : `./${rel}`;
+      term.sendText(`${envPrefix}go test -v -run "${testName}" ${pkg}`);
+    })
   );
 }
 

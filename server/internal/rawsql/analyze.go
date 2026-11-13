@@ -87,6 +87,7 @@ func (s Scope) Aliases() map[*indexer.Table]string {
 // Issue is a diagnostic in virtual coordinates.
 type Issue struct {
 	VStart, VEnd int
+	Severity     int
 	Message      string
 }
 
@@ -109,7 +110,14 @@ func (d *Doc) Check(sc Scope) []Issue {
 		qual := strings.ToLower(d.Text[m[2]:m[3]])
 		col := d.Text[m[4]:m[5]]
 		t := sc[qual]
-		if t == nil || t.Column(col) != nil {
+		if t == nil {
+			continue
+		}
+		if t.Column(col) != nil {
+			// Index-aware hint for WHERE / ON filters on tables with known indexes
+			if len(t.Indexes) > 0 && !t.HasIndex(col) && !strings.EqualFold(col, "deleted_at") && isFilterContext(d.Text, m[0]) {
+				out = append(out, Issue{m[4], m[5], 4, fmt.Sprintf("Column '%s' on '%s' is not the leading column of any indexed migration", col, t.Name)})
+			}
 			continue
 		}
 		if strings.HasPrefix(col, "__") {
@@ -119,9 +127,23 @@ func (d *Doc) Check(sc Scope) []Issue {
 		if sug := closestColumn(t, col); sug != "" {
 			msg += fmt.Sprintf(" (did you mean '%s'?)", sug)
 		}
-		out = append(out, Issue{m[4], m[5], msg})
+		out = append(out, Issue{m[4], m[5], 1, msg})
 	}
 	return out
+}
+
+func isFilterContext(sql string, pos int) bool {
+	up := strings.ToUpper(sql[:pos])
+	lastWhere := strings.LastIndex(up, "WHERE")
+	lastOn := strings.LastIndex(up, " ON ")
+	lastSel := strings.LastIndex(up, "SELECT")
+	lastOrder := strings.LastIndex(up, "ORDER BY")
+	lastGroup := strings.LastIndex(up, "GROUP BY")
+	filterPos := lastWhere
+	if lastOn > filterPos {
+		filterPos = lastOn
+	}
+	return filterPos > lastSel && filterPos > lastOrder && filterPos > lastGroup
 }
 
 func closestColumn(t *indexer.Table, col string) string {
