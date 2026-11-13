@@ -2,7 +2,7 @@
   "name": "goravel-vscode",
   "displayName": "Goravel",
   "description": "Goravel tooling: raw SQL LSP, ORM query builder intelligence, Config, Routes, Validation Rules, and Artisan CLI for Go projects",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "publisher": "rusmanplatd",
   "repository": {
     "type": "git",
@@ -125,6 +125,10 @@
       {
         "command": "goravel.logs.open",
         "title": "Goravel: Open storage/logs/goravel.log"
+      },
+      {
+        "command": "goravel.test.run",
+        "title": "Goravel: Run Go Test"
       }
     ],
     "menus": {
@@ -158,7 +162,7 @@
         },
         {
           "command": "goravel.artisan.makeMigration",
-          "when": "resourcePath =~ /\\/database\\/migrations/",
+          "when": "resourcePath =~ /\\/database\\/migrations([_a-zA-Z0-9-]*)(\\/|$)/",
           "group": "goravel@1"
         },
         {

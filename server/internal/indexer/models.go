@@ -45,8 +45,9 @@ func indexModels(c *Catalog, root string) {
 		return
 	}
 
-	// 1. string constants (OriginalTableName values etc.)
+	// 1. string constants (OriginalTableName, OriginalSchemaName values etc.)
 	consts := map[string]string{}
+	constLocs := map[string]Location{}
 	for _, pf := range files {
 		for _, d := range pf.file.Decls {
 			gd, ok := d.(*ast.GenDecl)
@@ -60,6 +61,14 @@ func indexModels(c *Catalog, root string) {
 						if bl, ok := vs.Values[i].(*ast.BasicLit); ok && bl.Kind == token.STRING {
 							if v, err := strconv.Unquote(bl.Value); err == nil {
 								consts[n.Name] = v
+								constLocs[n.Name] = loc(pf, n.Pos())
+								if strings.HasSuffix(n.Name, "OriginalTableName") {
+									c.TableConsts[n.Name] = &TableConstInfo{
+										Name:      n.Name,
+										TableName: StripSchema(v),
+										Loc:       constLocs[n.Name],
+									}
+								}
 							}
 						}
 					}
@@ -68,28 +77,48 @@ func indexModels(c *Catalog, root string) {
 		}
 	}
 
-	// 2. TableName() methods -> table name per model
+	// 2. TableName() and OriginalSchemaName() methods -> table/schema name per model
 	tableOf := map[string]string{}
+	schemaOf := map[string]string{}
+	constOfModel := map[string]string{}
 	for _, pf := range files {
 		for _, d := range pf.file.Decls {
 			fd, ok := d.(*ast.FuncDecl)
-			if !ok || fd.Recv == nil || fd.Name.Name != "TableName" || fd.Body == nil {
+			if !ok || fd.Recv == nil || fd.Body == nil {
 				continue
 			}
 			model := recvName(fd.Recv)
-			ast.Inspect(fd.Body, func(n ast.Node) bool {
-				if id, ok := n.(*ast.Ident); ok && strings.HasSuffix(id.Name, "OriginalTableName") {
-					if v, ok := consts[id.Name]; ok {
-						tableOf[model] = v
+			switch fd.Name.Name {
+			case "TableName":
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					if id, ok := n.(*ast.Ident); ok && strings.HasSuffix(id.Name, "OriginalTableName") {
+						if v, ok := consts[id.Name]; ok {
+							tableOf[model] = v
+							constOfModel[model] = id.Name
+						}
 					}
-				}
-				if bl, ok := n.(*ast.BasicLit); ok && bl.Kind == token.STRING {
-					if v, err := strconv.Unquote(bl.Value); err == nil && v != "." && tableOf[model] == "" {
-						tableOf[model] = v
+					if bl, ok := n.(*ast.BasicLit); ok && bl.Kind == token.STRING {
+						if v, err := strconv.Unquote(bl.Value); err == nil && v != "." && tableOf[model] == "" {
+							tableOf[model] = v
+						}
 					}
-				}
-				return true
-			})
+					return true
+				})
+			case "OriginalSchemaName":
+				ast.Inspect(fd.Body, func(n ast.Node) bool {
+					if id, ok := n.(*ast.Ident); ok && strings.HasSuffix(id.Name, "OriginalSchemaName") {
+						if v, ok := consts[id.Name]; ok {
+							schemaOf[model] = v
+						}
+					}
+					if bl, ok := n.(*ast.BasicLit); ok && bl.Kind == token.STRING {
+						if v, err := strconv.Unquote(bl.Value); err == nil && v != "" && schemaOf[model] == "" {
+							schemaOf[model] = v
+						}
+					}
+					return true
+				})
+			}
 		}
 	}
 
@@ -113,8 +142,16 @@ func indexModels(c *Catalog, root string) {
 				}
 				t := c.ensure(tname)
 				t.Model = ts.Name.Name
+				if sc := schemaOf[ts.Name.Name]; sc != "" {
+					t.Schema = sc
+				}
 				t.Loc = loc(pf, ts.Name.Pos())
 				c.Models[ts.Name.Name] = t
+				if cn := constOfModel[ts.Name.Name]; cn != "" {
+					if tc := c.TableConsts[cn]; tc != nil {
+						tc.Model = ts.Name.Name
+					}
+				}
 				for _, f := range st.Fields.List {
 					addFields(t, pf, f)
 				}
@@ -211,15 +248,16 @@ func addFields(t *Table, pf *parsedFile, f *ast.Field) {
 		if col == "" {
 			col = Snake(n.Name)
 		}
-		doc := ""
+		doc, example := "", ""
 		if f.Doc != nil {
-			doc = cleanDoc(f.Doc.Text())
+			doc, example = parseFieldDoc(f.Doc.Text())
 		}
 		t.add(&Column{
 			Name:     col,
 			GoName:   n.Name,
 			GoType:   goType,
 			Doc:      doc,
+			Example:  example,
 			Nullable: strings.HasPrefix(goType, "*") || strings.Contains(goType, "Null"),
 			Loc:      loc(pf, n.Pos()),
 		})
@@ -344,13 +382,21 @@ func resolveModelRelations(c *Catalog) {
 	}
 }
 
-var docRe = regexp.MustCompile(`@Description\s+(.*)`)
+var (
+	docRe     = regexp.MustCompile(`@Description\s+(.*)`)
+	exampleRe = regexp.MustCompile(`@Example\s+(.*)`)
+)
 
-func cleanDoc(s string) string {
-	if m := docRe.FindStringSubmatch(s); m != nil {
-		return strings.TrimSpace(m[1])
+func parseFieldDoc(s string) (doc, example string) {
+	if m := exampleRe.FindStringSubmatch(s); m != nil {
+		example = strings.TrimSpace(m[1])
+		s = exampleRe.ReplaceAllString(s, "")
 	}
-	return strings.TrimSpace(s)
+	if m := docRe.FindStringSubmatch(s); m != nil {
+		doc = strings.TrimSpace(m[1])
+		return doc, example
+	}
+	return strings.TrimSpace(s), example
 }
 
 func recvName(fl *ast.FieldList) string {

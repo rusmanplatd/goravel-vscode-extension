@@ -24,6 +24,7 @@ type Column struct {
 	GoType     string   `json:"goType"`
 	SQLType    string   `json:"sqlType"`
 	Doc        string   `json:"doc"`
+	Example    string   `json:"example,omitempty"`
 	Nullable   bool     `json:"nullable"`
 	ForeignKey string   `json:"foreignKey,omitempty"` // target_table.target_col
 	Loc        Location `json:"loc"`                  // Go model field
@@ -50,6 +51,7 @@ type IndexItem struct {
 // Table describes a table and the Go model backing it.
 type Table struct {
 	Name      string      `json:"name"`
+	Schema    string      `json:"schema,omitempty"`
 	Model     string      `json:"model"`
 	Columns   []*Column   `json:"columns"`
 	Relations []*Relation `json:"relations,omitempty"`
@@ -245,12 +247,30 @@ type UnregisteredItem struct {
 	Loc  Location `json:"loc"`
 }
 
+// TableConstInfo describes an *OriginalTableName constant in app/models.
+type TableConstInfo struct {
+	Name      string   `json:"name"`
+	TableName string   `json:"tableName"`
+	Model     string   `json:"model,omitempty"`
+	Loc       Location `json:"loc"`
+}
+
+// DBFunction describes an introspected database function or stored procedure.
+type DBFunction struct {
+	Schema     string `json:"schema,omitempty"`
+	Name       string `json:"name"`
+	Kind       string `json:"kind"` // FUNCTION | PROCEDURE
+	ReturnType string `json:"returnType,omitempty"`
+}
+
 // Catalog holds all indexed project metadata.
 type Catalog struct {
 	mu                 sync.RWMutex
 	Root               string
 	Tables             map[string]*Table               // by table name (no schema)
 	Models             map[string]*Table               // by Go model name
+	TableConsts        map[string]*TableConstInfo      // by constant identifier name
+	DBFunctions        []*DBFunction                   // live DB functions & procedures
 	Structs            map[string]*StructInfo          // all structs in app/models and app/http/requests
 	Configs            map[string]*ConfigItem          // by dot key (e.g. "jwt.secret")
 	EnvVars            map[string]string               // by env var name from .env*
@@ -271,6 +291,7 @@ func NewCatalog() *Catalog {
 	c := &Catalog{
 		Tables:             map[string]*Table{},
 		Models:             map[string]*Table{},
+		TableConsts:        map[string]*TableConstInfo{},
 		Structs:            map[string]*StructInfo{},
 		Configs:            map[string]*ConfigItem{},
 		EnvVars:            map[string]string{},

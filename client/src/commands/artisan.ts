@@ -147,15 +147,44 @@ export function registerArtisanCommands(
       const pos = new vscode.Position(lastLine, 0);
       editor.revealRange(new vscode.Range(pos, pos), vscode.TextEditorRevealType.Default);
     }),
-    vscode.commands.registerCommand("goravel.test.run", (dir: string, testName: string) => {
-      const term = getTerminal();
-      term.show(true);
-      const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || dir;
+    vscode.commands.registerCommand("goravel.test.run", async (dir?: string, testName?: string) => {
+      const activeFile = vscode.window.activeTextEditor?.document.uri.fsPath;
+      const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || dir || (activeFile ? path.dirname(activeFile) : "");
+      if (!ws) {
+        vscode.window.showErrorMessage("No workspace folder open.");
+        return;
+      }
+      if (!dir) {
+        dir = activeFile && activeFile.endsWith(".go") ? path.dirname(activeFile) : ws;
+      }
+      if (testName === undefined) {
+        const input = await vscode.window.showInputBox({
+          prompt: "Go test filter (-run regex, leave empty to run all tests in package)",
+          placeHolder: "TestExample",
+        });
+        if (input === undefined) return;
+        testName = input.trim();
+      }
       const hasEnvTesting = fs.existsSync(path.join(ws, ".env.testing"));
-      const envPrefix = hasEnvTesting ? "APP_ENV=testing " : "";
-      const rel = ws ? path.relative(ws, dir) || "." : dir;
+      const rel = path.relative(ws, dir) || ".";
       const pkg = rel.startsWith(".") ? rel : `./${rel}`;
-      term.sendText(`${envPrefix}go test -v -run "${testName}" ${pkg}`);
+      const args = ["test", "-v"];
+      if (testName) {
+        args.push("-run", testName);
+      }
+      args.push(pkg === "." && !activeFile ? "./..." : pkg);
+      const exec = new vscode.ShellExecution("go", args, {
+        cwd: ws,
+        env: hasEnvTesting ? { APP_ENV: "testing" } : undefined,
+      });
+      const task = new vscode.Task(
+        { type: "goravel-test" },
+        vscode.TaskScope.Workspace,
+        testName ? `Go Test: ${testName}` : "Go Test",
+        "goravel",
+        exec
+      );
+      await vscode.tasks.executeTask(task);
     })
   );
 }

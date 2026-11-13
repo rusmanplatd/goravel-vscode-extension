@@ -18,7 +18,7 @@ func Analyze(fi *FileInfo, cat *indexer.Catalog) []Diag {
 	var out []Diag
 	for _, d := range fi.Docs {
 		sc := fi.BuildScope(d, cat)
-		for _, is := range d.Check(sc) {
+		for _, is := range d.CheckWithCatalog(sc, cat) {
 			g1, ok1 := d.ToGo(is.VStart)
 			g2, ok2 := d.ToGo(is.VEnd)
 			if ok1 && ok2 {

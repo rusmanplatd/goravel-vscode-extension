@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/rusmanplatd/goravel-lsp/internal/indexer"
@@ -81,8 +82,9 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 	build := func(e ast.Expr, fn int, env map[string][]ast.Expr) *Doc {
 		d := &Doc{Func: fn, GoStart: off(e.Pos()), GoEnd: off(e.End())}
 		var sb strings.Builder
-		var flat func(e ast.Expr, depth int)
-		flat = func(e ast.Expr, depth int) {
+		phIdx := 1
+		var flat func(e ast.Expr, depth int, inSprintf bool)
+		flat = func(e ast.Expr, depth int, inSprintf bool) {
 			switch x := e.(type) {
 			case *ast.BasicLit:
 				if x.Kind != token.STRING {
@@ -95,18 +97,19 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 					return
 				}
 				raw := string(src[start:end])
-				if strings.Contains(raw, "%") {
-					d.Dynamic = true
+				if inSprintf {
+					appendSprintfLit(&sb, &d.Segs, raw, start, &phIdx, &d.Dynamic)
+				} else {
+					vs := sb.Len()
+					sb.WriteString(neutralize(raw))
+					d.Segs = append(d.Segs, Seg{vs, sb.Len(), start})
 				}
-				vs := sb.Len()
-				sb.WriteString(neutralize(raw))
-				d.Segs = append(d.Segs, Seg{vs, sb.Len(), start})
 			case *ast.ParenExpr:
-				flat(x.X, depth)
+				flat(x.X, depth, inSprintf)
 			case *ast.BinaryExpr:
 				if x.Op == token.ADD {
-					flat(x.X, depth)
-					flat(x.Y, depth)
+					flat(x.X, depth, inSprintf)
+					flat(x.Y, depth, inSprintf)
 				} else {
 					d.Dynamic = true
 					sb.WriteString("__")
@@ -117,7 +120,7 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 					sb.WriteString(t)
 				} else if exprs := env[x.Name]; len(exprs) > 0 && depth < 8 {
 					for _, ex := range exprs {
-						flat(ex, depth+1)
+						flat(ex, depth+1, inSprintf)
 					}
 				} else {
 					d.Dynamic = true
@@ -126,7 +129,7 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 			case *ast.CallExpr:
 				if isSprintf(x) && len(x.Args) > 0 {
 					d.Dynamic = true
-					flat(x.Args[0], depth)
+					flat(x.Args[0], depth, true)
 				} else if tname := extractTableNameExpr(x, cat); tname != "" {
 					sb.WriteString(tname)
 				} else {
@@ -138,33 +141,65 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 				sb.WriteString("__")
 			}
 		}
-		flat(e, 0)
+		flat(e, 0, false)
 		d.Text = sb.String()
 		return d
+	}
+
+	seen := map[[2]int]bool{}
+	addDoc := func(d *Doc) {
+		k := [2]int{d.GoStart, d.GoEnd}
+		if seen[k] {
+			return
+		}
+		seen[k] = true
+		fi.Docs = append(fi.Docs, d)
 	}
 
 	handle := func(root ast.Node, fn int) {
 		ast.Inspect(root, func(n ast.Node) bool {
 			switch x := n.(type) {
+			case *ast.AssignStmt:
+				for i, lhs := range x.Lhs {
+					if i >= len(x.Rhs) {
+						break
+					}
+					if id, ok := lhs.(*ast.Ident); ok && isSQLVarName(id.Name) {
+						if d := build(x.Rhs[i], fn, nil); len(d.Segs) > 0 {
+							addDoc(d)
+						}
+					}
+				}
+			case *ast.ValueSpec:
+				for i, id := range x.Names {
+					if i >= len(x.Values) {
+						break
+					}
+					if isSQLVarName(id.Name) {
+						if d := build(x.Values[i], fn, nil); len(d.Segs) > 0 {
+							addDoc(d)
+						}
+					}
+				}
 			case *ast.BinaryExpr:
 				if x.Op != token.ADD {
 					return true
 				}
 				if d := build(x, fn, nil); len(d.Segs) > 0 && anySQL(d, src) {
-					fi.Docs = append(fi.Docs, d)
+					addDoc(d)
 					return false
 				}
 			case *ast.CallExpr:
 				if isSprintf(x) && len(x.Args) > 0 {
 					if d := build(x, fn, nil); len(d.Segs) > 0 && sqlish.MatchString(d.Text) {
-						fi.Docs = append(fi.Docs, d)
+						addDoc(d)
 						return false
 					}
 				}
 			case *ast.BasicLit:
 				if x.Kind == token.STRING {
 					if d := build(x, fn, nil); sqlish.MatchString(d.Text) {
-						fi.Docs = append(fi.Docs, d)
+						addDoc(d)
 					}
 				}
 			}
@@ -232,6 +267,71 @@ func isSprintf(c *ast.CallExpr) bool {
 	}
 	id, ok := sel.X.(*ast.Ident)
 	return ok && id.Name == "fmt" && sel.Sel.Name == "Sprintf"
+}
+
+func isSQLVarName(name string) bool {
+	low := strings.ToLower(name)
+	return strings.Contains(low, "query") || strings.Contains(low, "sql")
+}
+
+// appendSprintfLit neutralizes a fmt.Sprintf format string literal while replacing
+// %d/%s/%v format verbs with sequential $1..$N SQL placeholders and preserving Seg byte mapping.
+func appendSprintfLit(sb *strings.Builder, segs *[]Seg, raw string, goStart int, phIdx *int, dynamic *bool) {
+	neut := neutralize(raw)
+	n := len(raw)
+	segGoStart := goStart
+	segVStart := sb.Len()
+
+	flushSeg := func(goEnd int) {
+		if sb.Len() > segVStart {
+			*segs = append(*segs, Seg{VStart: segVStart, VEnd: sb.Len(), GoStart: segGoStart})
+		}
+		segGoStart = goEnd
+	}
+
+	for i := 0; i < n; i++ {
+		if i+1 < n && raw[i] == '%' {
+			verb := raw[i+1]
+			if verb == '%' {
+				sb.WriteString("%%")
+				i++
+				continue
+			}
+			if verb == 'd' || verb == 's' || verb == 'v' {
+				*dynamic = true
+				if i > 0 && raw[i-1] == '$' {
+					// e.g. $%d -> already has '$' before it; emit placeholder digit(s)
+					ph := strconv.Itoa(*phIdx)
+					*phIdx++
+					if len(ph) == 1 {
+						sb.WriteByte(ph[0])
+						sb.WriteByte(' ')
+					} else {
+						flushSeg(goStart + i)
+						sb.WriteString(ph)
+						segGoStart = goStart + i + 2
+						segVStart = sb.Len()
+					}
+					i++
+					continue
+				}
+				ph := "$" + strconv.Itoa(*phIdx)
+				*phIdx++
+				if len(ph) == 2 {
+					sb.WriteString(ph)
+				} else {
+					flushSeg(goStart + i)
+					sb.WriteString(ph)
+					segGoStart = goStart + i + 2
+					segVStart = sb.Len()
+				}
+				i++
+				continue
+			}
+		}
+		sb.WriteByte(neut[i])
+	}
+	flushSeg(goStart + n)
 }
 
 // neutralize keeps byte length but removes escapes/format verbs so SQL scanning works.

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -215,6 +216,20 @@ func (s *Server) dispatch(m *message) {
 		for uri := range s.docs {
 			s.diagnose(uri)
 		}
+	case "workspace/didChangeConfiguration":
+		var p struct {
+			Settings map[string]any `json:"settings"`
+		}
+		_ = json.Unmarshal(m.Params, &p)
+		if enabled, ok := extractLiveIntrospectionSetting(p.Settings); ok {
+			if indexer.LiveDBEnabled != enabled {
+				indexer.LiveDBEnabled = enabled
+				s.reindex()
+				for uri := range s.docs {
+					s.diagnose(uri)
+				}
+			}
+		}
 	case "textDocument/didClose":
 		var p struct {
 			TextDocument struct {
@@ -395,6 +410,14 @@ func (s *Server) completion(raw json.RawMessage) any {
 			})
 		}
 	default:
+		if tblName := insertTargetTable(d.Text, v); tblName != "" {
+			if t := s.cat.Table(tblName); t != nil {
+				for _, c := range t.Columns {
+					items = append(items, colItem(t, c))
+				}
+				return map[string]any{"isIncomplete": false, "items": items}
+			}
+		}
 		if cc.WantColAlias {
 			for _, oc := range d.SelectAliases() {
 				detail := "column alias"
@@ -425,6 +448,16 @@ func (s *Server) completion(raw json.RawMessage) any {
 				items = append(items, colItem(t, c))
 			}
 		}
+		for _, fn := range sqlFunctions {
+			items = append(items, map[string]any{"label": fn, "kind": 3, "detail": "SQL function"})
+		}
+		for _, fn := range s.cat.DBFunctions {
+			detail := fn.Kind
+			if fn.ReturnType != "" {
+				detail += " -> " + fn.ReturnType
+			}
+			items = append(items, map[string]any{"label": fn.Name, "kind": 3, "detail": detail})
+		}
 		for _, kw := range keywords {
 			items = append(items, map[string]any{"label": kw, "kind": 14})
 		}
@@ -432,7 +465,23 @@ func (s *Server) completion(raw json.RawMessage) any {
 	return map[string]any{"isIncomplete": false, "items": items}
 }
 
-var keywords = strings.Fields("SELECT FROM WHERE JOIN LEFT INNER ON AND OR ORDER GROUP BY LIMIT OFFSET INSERT INTO VALUES UPDATE SET DELETE RETURNING ILIKE LIKE IN IS NULL NOT COUNT COALESCE NOW")
+var (
+	keywords     = strings.Fields("SELECT DISTINCT FROM WHERE JOIN LEFT RIGHT INNER OUTER FULL CROSS ON USING AND OR NOT IN IS NULL TRUE FALSE AS INTO VALUES UPDATE SET DELETE RETURNING ILIKE LIKE BETWEEN EXISTS CASE WHEN THEN ELSE END GROUP BY ORDER ASC DESC HAVING LIMIT OFFSET UNION ALL")
+	sqlFunctions = strings.Fields("COUNT SUM AVG MIN MAX COALESCE NULLIF CAST NOW CURRENT_TIMESTAMP CURRENT_DATE LOWER UPPER TRIM BTRIM LTRIM RTRIM LENGTH SUBSTRING CONCAT REPLACE SPLIT_PART TO_CHAR TO_DATE TO_TIMESTAMP DATE_TRUNC EXTRACT AGE ROW_NUMBER RANK DENSE_RANK JSON_AGG JSONB_BUILD_OBJECT STRING_AGG ARRAY_AGG")
+)
+
+var insertColsRe = regexp.MustCompile(`(?is)\bINSERT\s+INTO\s+([A-Za-z_][\w."]*)\s*\([^)]*$`)
+
+func insertTargetTable(sql string, v int) string {
+	if v < 0 || v > len(sql) {
+		return ""
+	}
+	m := insertColsRe.FindStringSubmatch(sql[:v])
+	if len(m) >= 2 {
+		return m[1]
+	}
+	return ""
+}
 
 func colItem(t *indexer.Table, c *indexer.Column) map[string]any {
 	return map[string]any{
@@ -475,6 +524,9 @@ func colMD(t *indexer.Table, c *indexer.Column) string {
 	if c.Doc != "" {
 		fmt.Fprintf(&b, "\n%s\n", c.Doc)
 	}
+	if c.Example != "" {
+		fmt.Fprintf(&b, "\nExample: `%s`\n", c.Example)
+	}
 	return b.String()
 }
 
@@ -483,7 +535,11 @@ func tableMD(t *indexer.Table) string {
 		return ""
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "**%s**", t.Name)
+	if t.Schema != "" {
+		fmt.Fprintf(&b, "**%s.%s**", t.Schema, t.Name)
+	} else {
+		fmt.Fprintf(&b, "**%s**", t.Name)
+	}
 	if t.Model != "" {
 		fmt.Fprintf(&b, " — `models.%s`", t.Model)
 	}
@@ -517,6 +573,24 @@ func (s *Server) hover(raw json.RawMessage) any {
 	}
 	if h := framework.ScheduleHover(path, text, off); h != nil {
 		return map[string]any{"contents": map[string]any{"kind": "markdown", "value": h.Markdown}}
+	}
+
+	// 1c. OriginalTableName constant symbol hover
+	if word, st, en := identAtOffset(text, off); word != "" {
+		if tc := s.cat.TableConsts[word]; tc != nil {
+			var b strings.Builder
+			fmt.Fprintf(&b, "**`%s`** = `\"%s\"`\n\n", tc.Name, tc.TableName)
+			if tc.Model != "" {
+				fmt.Fprintf(&b, "- Model: `models.%s`\n", tc.Model)
+			}
+			if t := s.cat.Table(tc.TableName); t != nil {
+				fmt.Fprintf(&b, "- Columns: %d\n", len(t.Columns))
+			}
+			return map[string]any{
+				"contents": map[string]any{"kind": "markdown", "value": b.String()},
+				"range":    Range{offsetToPos(text, st), offsetToPos(text, en)},
+			}
+		}
 	}
 
 	// 2. Raw SQL hover
@@ -585,6 +659,17 @@ func (s *Server) definition(raw json.RawMessage) any {
 	}
 	if d := framework.RouteMiddlewareDefinition(path, text, s.cat, off); d != nil {
 		add(d.Loc, 0)
+	}
+	if word, _, _ := identAtOffset(text, off); word != "" {
+		if tc := s.cat.TableConsts[word]; tc != nil {
+			pos := offsetToPos(text, off)
+			if tc.Loc.Valid() && !(filepath.Clean(tc.Loc.File) == filepath.Clean(path) && tc.Loc.Line == pos.Line) {
+				add(tc.Loc, len(tc.Name))
+			} else if t := s.cat.Table(tc.TableName); t != nil {
+				add(t.Loc, len(t.Model))
+				add(t.MigLoc, 0)
+			}
+		}
 	}
 	if len(locs) > 0 {
 		return locs
@@ -702,27 +787,30 @@ func (s *Server) codeAction(raw json.RawMessage) any {
 	if at, code, name, ok := rawsql.GenerateRowStruct(fi, s.cat, off); ok {
 		edit("Generate row struct "+name, "refactor.extract", at, at, code)
 	}
-	if d := fi.DocAt(off); d != nil && s.cat.EnvVars["DB_HOST"] != "" {
-		actions = append(actions,
-			map[string]any{
-				"title": "Goravel: Explain SQL Query against DB",
-				"kind":  "quickfix",
-				"command": map[string]any{
-					"title":     "Goravel: Explain SQL Query against DB",
-					"command":   "goravel.explainQuery",
-					"arguments": []any{d.Text},
+	if d := fi.DocAt(off); d != nil {
+		cfg := indexer.ResolveDBConfig(s.cat)
+		if cfg.Database != "" && (cfg.Host != "" || cfg.Driver == "sqlite" || cfg.Driver == "sqlite3") {
+			actions = append(actions,
+				map[string]any{
+					"title": "Goravel: Explain SQL Query against DB",
+					"kind":  "quickfix",
+					"command": map[string]any{
+						"title":     "Goravel: Explain SQL Query against DB",
+						"command":   "goravel.explainQuery",
+						"arguments": []any{d.Text},
+					},
 				},
-			},
-			map[string]any{
-				"title": "Goravel: Preview Query Results (Live DB)",
-				"kind":  "quickfix",
-				"command": map[string]any{
-					"title":     "Goravel: Preview Query Results (Live DB)",
-					"command":   "goravel.previewQuery",
-					"arguments": []any{d.Text},
+				map[string]any{
+					"title": "Goravel: Preview Query Results (Live DB)",
+					"kind":  "quickfix",
+					"command": map[string]any{
+						"title":     "Goravel: Preview Query Results (Live DB)",
+						"command":   "goravel.previewQuery",
+						"arguments": []any{d.Text},
+					},
 				},
-			},
-		)
+			)
+		}
 	}
 	path := uriToPath(uri)
 	var fActions []framework.CodeAction
@@ -1018,4 +1106,43 @@ func uriToPath(uri string) string {
 
 func pathToURI(p string) string {
 	return (&url.URL{Scheme: "file", Path: filepath.ToSlash(p)}).String()
+}
+
+func identAtOffset(text string, off int) (string, int, int) {
+	if off < 0 || off > len(text) {
+		return "", 0, 0
+	}
+	isIdent := func(b byte) bool {
+		return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+	}
+	start := off
+	for start > 0 && isIdent(text[start-1]) {
+		start--
+	}
+	end := off
+	for end < len(text) && isIdent(text[end]) {
+		end++
+	}
+	if start == end {
+		return "", 0, 0
+	}
+	return text[start:end], start, end
+}
+
+func extractLiveIntrospectionSetting(settings map[string]any) (bool, bool) {
+	if settings == nil {
+		return false, false
+	}
+	if g, ok := settings["goravel"].(map[string]any); ok {
+		settings = g
+	}
+	if sqlCfg, ok := settings["sql"].(map[string]any); ok {
+		if v, ok := sqlCfg["liveIntrospection"].(bool); ok {
+			return v, true
+		}
+	}
+	if v, ok := settings["liveIntrospection"].(bool); ok {
+		return v, true
+	}
+	return false, false
 }

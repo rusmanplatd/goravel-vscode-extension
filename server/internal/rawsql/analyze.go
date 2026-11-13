@@ -136,12 +136,42 @@ var ddl = regexp.MustCompile(`(?is)^\s*(CREATE|ALTER|DROP|DO|TRUNCATE|COMMENT|GR
 
 var dotRe = regexp.MustCompile(`([A-Za-z_]\w*)\.([A-Za-z_]\w*)`)
 
-// Check finds unknown `alias.column` references.
+// Check finds unknown `alias.column` references and SQL syntax errors.
 func (d *Doc) Check(sc Scope) []Issue {
+	return d.CheckWithCatalog(sc, nil)
+}
+
+// CheckWithCatalog validates SQL syntax, table names, qualified `alias.column`,
+// and unqualified column references against the schema catalog.
+func (d *Doc) CheckWithCatalog(sc Scope, cat *indexer.Catalog) []Issue {
 	var out []Issue
 	if ddl.MatchString(d.Text) {
 		return nil // DDL/policy statements reuse aliases; too ambiguous to validate
 	}
+
+	out = append(out, checkSQLSyntax(d.Text, d.Dynamic)...)
+
+	hasUnknownTable := false
+	if cat != nil && len(cat.Tables) > 0 {
+		ctes := extractCTEs(d.Text, sc, cat)
+		for _, m := range aliasRe.FindAllStringSubmatchIndex(d.Text, -1) {
+			tbl := d.Text[m[2]:m[3]]
+			low := strings.ToLower(indexer.StripSchema(tbl))
+			if strings.HasPrefix(tbl, "__") || strings.Contains(tbl, "__") || notAlias[low] || ctes[low] != nil {
+				continue
+			}
+			// Skip table-valued functions like FROM unnest(...)
+			after := strings.TrimSpace(d.Text[m[3]:])
+			if strings.HasPrefix(after, "(") {
+				continue
+			}
+			if cat.Table(tbl) == nil {
+				hasUnknownTable = true
+				out = append(out, Issue{m[2], m[3], 1, fmt.Sprintf("Unknown table '%s'", tbl)})
+			}
+		}
+	}
+
 	for _, m := range dotRe.FindAllStringSubmatchIndex(d.Text, -1) {
 		if m[0] > 0 {
 			if p := d.Text[m[0]-1]; p == '.' || p == '"' || p == '\'' || p == '_' {
@@ -170,6 +200,11 @@ func (d *Doc) Check(sc Scope) []Issue {
 		}
 		out = append(out, Issue{m[4], m[5], 1, msg})
 	}
+
+	if !hasUnknownTable && len(sc.Tables()) > 0 {
+		out = append(out, checkUnqualifiedColumns(d.Text, sc)...)
+	}
+
 	return out
 }
 

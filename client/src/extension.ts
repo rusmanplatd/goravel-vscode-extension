@@ -109,6 +109,20 @@ export async function activate(ctx: vscode.ExtensionContext) {
   );
 
   ctx.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("goravel.sql.liveIntrospection") && client) {
+        const updated = vscode.workspace.getConfiguration("goravel");
+        client.sendNotification("workspace/didChangeConfiguration", {
+          settings: {
+            goravel: {
+              sql: {
+                liveIntrospection: updated.get<boolean>("sql.liveIntrospection", false),
+              },
+            },
+          },
+        });
+      }
+    }),
     vscode.commands.registerCommand("goravel.restartServer", async () => {
       await client?.stop();
       client = undefined;
