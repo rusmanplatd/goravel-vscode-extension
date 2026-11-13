@@ -78,6 +78,12 @@ func SemanticTokens(fi *FileInfo, cat *indexer.Catalog) []SemToken {
 	}
 
 	for _, d := range fi.Docs {
+		for _, vr := range d.VarRefs {
+			if vr.GoEnd > vr.GoStart && !seen[vr.GoStart] {
+				seen[vr.GoStart] = true
+				out = append(out, SemToken{GoStart: vr.GoStart, Length: vr.GoEnd - vr.GoStart, Type: SemType})
+			}
+		}
 		sc := fi.BuildScope(d, cat)
 		for _, m := range semTokRe.FindAllStringIndex(d.Text, -1) {
 			tok := d.Text[m[0]:m[1]]

@@ -205,3 +205,39 @@ func ormAliasTest() {
 		t.Error("unexpected diagnostic on valid aliased columns city_name/province_name")
 	}
 }
+
+func TestTableVarSemanticTokenHoverAndDef(t *testing.T) {
+	root, uri, text := fixture(t)
+	extra := `
+func tableVarTest(ctx any) {
+	userModelType := models.RefGeoCity{}.TableName()
+	q := ` + "`SELECT ct.id FROM ` + userModelType + ` ct WHERE ct.name = '` + userModelType + `'`" + `
+	_ = q
+}
+`
+	doc := text + extra
+	varPos := posAfter(doc, "WHERE ct.name = '` + userModelType", -len("userModelType")+2)
+
+	res := run(t, init1(root), open(uri, doc),
+		req(2, "textDocument/hover", uri, varPos),
+		req(3, "textDocument/definition", uri, varPos),
+		map[string]any{"id": 4, "method": "textDocument/semanticTokens/full", "params": map[string]any{"textDocument": map[string]any{"uri": uri}}},
+		map[string]any{"method": "exit"},
+	)
+
+	h, _ := json.Marshal(find(res, 2)["result"])
+	if !strings.Contains(string(h), "ref_geo_cities") || !strings.Contains(string(h), "RefGeoCity") {
+		t.Errorf("expected hover on table var userModelType, got: %s", h)
+	}
+
+	d, _ := json.Marshal(find(res, 3)["result"])
+	if !strings.Contains(string(d), "ref_geo_city.go") {
+		t.Errorf("expected definition on table var userModelType, got: %s", d)
+	}
+
+	sem, _ := json.Marshal(find(res, 4)["result"])
+	if !strings.Contains(string(sem), `"data":[`) {
+		t.Errorf("expected semantic tokens, got: %s", sem)
+	}
+}
+

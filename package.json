@@ -2,7 +2,7 @@
   "name": "goravel-vscode",
   "displayName": "Goravel",
   "description": "Goravel tooling: raw SQL LSP, ORM query builder intelligence, Config, Routes, Validation Rules, and Artisan CLI for Go projects",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "publisher": "rusmanplatd",
   "repository": {
     "type": "git",

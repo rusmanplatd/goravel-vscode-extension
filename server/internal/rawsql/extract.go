@@ -18,10 +18,18 @@ type Seg struct {
 	GoStart      int
 }
 
+// VarRef records a Go table-name variable interpolated into a SQL Doc.
+type VarRef struct {
+	GoStart int
+	GoEnd   int
+	Table   string
+}
+
 // Doc is one reconstructed SQL statement/fragment.
 type Doc struct {
 	Text    string
 	Segs    []Seg
+	VarRefs []VarRef
 	Func    int // offset of enclosing func (or -1)
 	GoStart int
 	GoEnd   int
@@ -105,6 +113,7 @@ func Extract(path string, src []byte, cat *indexer.Catalog) *FileInfo {
 				}
 			case *ast.Ident:
 				if t, ok := vars[x.Name]; ok {
+					d.VarRefs = append(d.VarRefs, VarRef{GoStart: off(x.Pos()), GoEnd: off(x.End()), Table: t})
 					sb.WriteString(t)
 				} else if exprs := env[x.Name]; len(exprs) > 0 && depth < 8 {
 					for _, ex := range exprs {
@@ -262,6 +271,19 @@ func (d *Doc) ToGo(v int) (int, bool) {
 		}
 	}
 	return 0, false
+}
+
+// VarRefAt returns the interpolated table-name variable at Go offset, if any.
+func (fi *FileInfo) VarRefAt(goOff int) *VarRef {
+	for _, d := range fi.Docs {
+		for i := range d.VarRefs {
+			vr := &d.VarRefs[i]
+			if goOff >= vr.GoStart && goOff <= vr.GoEnd {
+				return vr
+			}
+		}
+	}
+	return nil
 }
 
 // DocAt returns the doc whose Go range contains offset.

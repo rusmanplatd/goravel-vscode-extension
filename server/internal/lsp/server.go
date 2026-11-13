@@ -520,8 +520,18 @@ func (s *Server) hover(raw json.RawMessage) any {
 	}
 
 	// 2. Raw SQL hover
-	_, _, _, _, d, v, sc, ok := s.resolve(raw)
+	_, _, _, fi, d, v, sc, ok := s.resolve(raw)
 	if !ok {
+		if fi != nil {
+			if vr := fi.VarRefAt(off); vr != nil {
+				if t := s.cat.Table(vr.Table); t != nil {
+					return map[string]any{
+						"contents": map[string]any{"kind": "markdown", "value": tableMD(t)},
+						"range":    Range{offsetToPos(text, vr.GoStart), offsetToPos(text, vr.GoEnd)},
+					}
+				}
+			}
+		}
 		return nil
 	}
 	ref := d.RefAt(v, sc)
@@ -581,8 +591,19 @@ func (s *Server) definition(raw json.RawMessage) any {
 	}
 
 	// 2. Raw SQL definition
-	_, _, _, _, d, v, sc, ok := s.resolve(raw)
+	_, _, _, fi, d, v, sc, ok := s.resolve(raw)
 	if !ok {
+		if fi != nil {
+			if vr := fi.VarRefAt(off); vr != nil {
+				if t := s.cat.Table(vr.Table); t != nil {
+					add(t.Loc, len(t.Model))
+					add(t.MigLoc, 0)
+					if len(locs) > 0 {
+						return locs
+					}
+				}
+			}
+		}
 		return nil
 	}
 	ref := d.RefAt(v, sc)
