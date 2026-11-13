@@ -395,6 +395,31 @@ func (s *Server) completion(raw json.RawMessage) any {
 			})
 		}
 	default:
+		if cc.WantColAlias {
+			for _, oc := range d.SelectAliases() {
+				detail := "column alias"
+				if oc.Expr != "" {
+					detail = "alias -> " + oc.Expr
+				}
+				items = append(items, map[string]any{
+					"label":    oc.Name,
+					"kind":     5,
+					"detail":   detail,
+					"sortText": "0_" + oc.Name,
+				})
+			}
+		}
+		for alias, t := range sc {
+			if alias != strings.ToLower(t.Name) {
+				items = append(items, map[string]any{
+					"label":         alias,
+					"kind":          7,
+					"detail":        "alias -> " + t.Name,
+					"sortText":      "1_" + alias,
+					"documentation": map[string]any{"kind": "markdown", "value": tableMD(t)},
+				})
+			}
+		}
 		for _, t := range sc.Tables() {
 			for _, c := range t.Columns {
 				items = append(items, colItem(t, c))
@@ -503,9 +528,21 @@ func (s *Server) hover(raw json.RawMessage) any {
 	if ref == nil {
 		return nil
 	}
-	md := tableMD(ref.Table)
-	if ref.Column != nil {
+	md := ""
+	switch {
+	case ref.ColAlias != nil:
+		md = fmt.Sprintf("**Column Alias `%s`**\n\n", ref.ColAlias.Name)
+		if ref.Table != nil && ref.Column != nil {
+			md += colMD(ref.Table, ref.Column)
+		} else if ref.ColAlias.Expr != "" {
+			md += fmt.Sprintf("- Expression: `%s`\n", ref.ColAlias.Expr)
+		}
+	case ref.Column != nil:
 		md = colMD(ref.Table, ref.Column)
+	case ref.TableAlias != "" && ref.Table != nil:
+		md = fmt.Sprintf("**Table Alias `%s`** → %s", ref.TableAlias, tableMD(ref.Table))
+	default:
+		md = tableMD(ref.Table)
 	}
 	res := map[string]any{"contents": map[string]any{"kind": "markdown", "value": md}}
 	if g1, ok1 := d.ToGo(ref.VStart); ok1 {
@@ -517,7 +554,7 @@ func (s *Server) hover(raw json.RawMessage) any {
 }
 
 func (s *Server) definition(raw json.RawMessage) any {
-	_, path, text, _, off, inputOK := s.resolveInput(raw)
+	uri, path, text, _, off, inputOK := s.resolveInput(raw)
 	if !inputOK {
 		return nil
 	}
@@ -552,10 +589,25 @@ func (s *Server) definition(raw json.RawMessage) any {
 	if ref == nil {
 		return nil
 	}
+	addVirtual := func(vs, ve int) {
+		if g1, ok1 := d.ToGo(vs); ok1 {
+			if g2, ok2 := d.ToGo(ve); ok2 {
+				locs = append(locs, LocationT{uri, Range{offsetToPos(text, g1), offsetToPos(text, g2)}})
+			}
+		}
+	}
+	if ref.ColAlias != nil && ref.VStart != ref.ColAlias.VStart {
+		addVirtual(ref.ColAlias.VStart, ref.ColAlias.VEnd)
+	}
 	if ref.Column != nil {
 		add(ref.Column.Loc, len(ref.Column.GoName))
 		add(ref.Column.MigLoc, len(ref.Column.Name))
-	} else {
+	} else if ref.Table != nil {
+		if ref.TableAlias != "" {
+			if vs, ve, ok := d.TableAliasDef(ref.TableAlias); ok && vs != ref.VStart {
+				addVirtual(vs, ve)
+			}
+		}
 		add(ref.Table.Loc, len(ref.Table.Model))
 		add(ref.Table.MigLoc, 0)
 	}

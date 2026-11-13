@@ -41,8 +41,25 @@ type Span struct {
 	CallEnd    int // byte offset of enclosing call end (for inlay hints)
 	Text       string
 	Table      *indexer.Table      // resolved table for ORM / Patch spans
+	Aliases    map[string]*indexer.Table // table aliases in ORM chain (lowercase -> Table)
 	ReqStruct  *indexer.StructInfo // resolved request struct for Rule spans
 	Routes     []*indexer.RouteItem // matched routes for controller method
+}
+
+func (sp *Span) resolveTable(qual string) *indexer.Table {
+	if qual != "" {
+		lq := strings.ToLower(qual)
+		if sp.Aliases != nil {
+			if t := sp.Aliases[lq]; t != nil {
+				return t
+			}
+		}
+		if sp.Table != nil && strings.EqualFold(qual, sp.Table.Name) {
+			return sp.Table
+		}
+		return nil
+	}
+	return sp.Table
 }
 
 // FileAnalysis holds all framework spans extracted from a Go source file.
@@ -60,6 +77,7 @@ var (
 	routeParamMethods = map[string]bool{"Route": true, "RouteInt": true, "RouteInt64": true}
 	swaggerRouterRe   = regexp.MustCompile(`@Router\s+(\S+)\s+\[([a-zA-Z]+)\]`)
 	identRe           = regexp.MustCompile(`[A-Za-z_]\w*`)
+	ormQualRe         = regexp.MustCompile(`([A-Za-z_]\w*)\.(\w*)$`)
 	whereSkipWords  = map[string]bool{
 		"and": true, "or": true, "not": true, "is": true, "null": true, "in": true, "like": true, "ilike": true,
 		"between": true, "exists": true, "true": true, "false": true, "asc": true, "desc": true, "as": true,
@@ -276,6 +294,8 @@ func AnalyzeFile(path string, src []byte, cat *indexer.Catalog) *FileAnalysis {
 				if t == nil {
 					return true
 				}
+				aliases := aliasesFromExpr(call, varTable, recvTable, cat)
+				prevLen := len(fa.Spans)
 				switch {
 				case ormWhereMethods[mname] && len(call.Args) >= 1:
 					if bl, ok := call.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
@@ -297,6 +317,11 @@ func AnalyzeFile(path string, src []byte, cat *indexer.Catalog) *FileAnalysis {
 						if bl, ok := arg.(*ast.BasicLit); ok && bl.Kind == token.STRING {
 							addLitSpan(fa, off, bl, SpanORMColumn, 0, t, nil)
 						}
+					}
+				}
+				if len(aliases) > 0 {
+					for i := prevLen; i < len(fa.Spans); i++ {
+						fa.Spans[i].Aliases = aliases
 					}
 				}
 			}
@@ -411,7 +436,14 @@ func tableFromExpr(e ast.Expr, varTable map[string]*indexer.Table, recvTable map
 	case *ast.BasicLit:
 		if x.Kind == token.STRING {
 			if s, err := strconv.Unquote(x.Value); err == nil {
-				return cat.Table(s)
+				tblName, _ := parseTableAndAlias(s)
+				return cat.Table(tblName)
+			}
+		}
+	case *ast.BinaryExpr:
+		if x.Op == token.ADD {
+			if t := tableFromExpr(x.X, varTable, recvTable, cat); t != nil {
+				return t
 			}
 		}
 	case *ast.UnaryExpr:
@@ -452,6 +484,85 @@ func tableFromExpr(e ast.Expr, varTable map[string]*indexer.Table, recvTable map
 		}
 	}
 	return nil
+}
+
+func parseTableAndAlias(s string) (tableName, alias string) {
+	fields := strings.Fields(strings.TrimSpace(s))
+	if len(fields) == 0 {
+		return "", ""
+	}
+	tableName = fields[0]
+	if len(fields) >= 3 && strings.EqualFold(fields[1], "AS") {
+		alias = strings.ToLower(fields[2])
+	} else if len(fields) >= 2 && !strings.EqualFold(fields[1], "ON") && !strings.EqualFold(fields[1], "WHERE") {
+		alias = strings.ToLower(fields[1])
+	}
+	return tableName, alias
+}
+
+var ormJoinAliasRe = regexp.MustCompile(`(?i)\b(?:JOIN\s+)?([A-Za-z_][\w."]*)(?:\s+(?:AS\s+)?([A-Za-z_]\w*))?(?:\s+ON\b|$)`)
+
+func aliasesFromExpr(e ast.Expr, varTable map[string]*indexer.Table, recvTable map[string]*indexer.Table, cat *indexer.Catalog) map[string]*indexer.Table {
+	out := map[string]*indexer.Table{}
+	var walk func(ex ast.Expr)
+	walk = func(ex ast.Expr) {
+		call, ok := ex.(*ast.CallExpr)
+		if !ok {
+			return
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok {
+			return
+		}
+		walk(sel.X)
+		switch sel.Sel.Name {
+		case "Table":
+			if len(call.Args) > 0 {
+				if bl, ok := call.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
+					if s, err := strconv.Unquote(bl.Value); err == nil {
+						tn, al := parseTableAndAlias(s)
+						if t := cat.Table(tn); t != nil {
+							out[strings.ToLower(indexer.StripSchema(tn))] = t
+							if al != "" {
+								out[al] = t
+							}
+						}
+					}
+				} else if bin, ok := call.Args[0].(*ast.BinaryExpr); ok && bin.Op == token.ADD {
+					if t := tableFromExpr(bin.X, varTable, recvTable, cat); t != nil {
+						if bl, ok := bin.Y.(*ast.BasicLit); ok && bl.Kind == token.STRING {
+							if s, err := strconv.Unquote(bl.Value); err == nil {
+								_, al := parseTableAndAlias("tbl " + strings.TrimSpace(s))
+								if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(s)), "AS ") {
+									_, al = parseTableAndAlias("tbl " + s)
+								}
+								if al != "" {
+									out[al] = t
+								}
+							}
+						}
+					}
+				}
+			}
+		case "Join":
+			if len(call.Args) > 0 {
+				if bl, ok := call.Args[0].(*ast.BasicLit); ok && bl.Kind == token.STRING {
+					if s, err := strconv.Unquote(bl.Value); err == nil {
+						if m := ormJoinAliasRe.FindStringSubmatch(s); m != nil {
+							if t := cat.Table(m[1]); t != nil {
+								out[strings.ToLower(indexer.StripSchema(m[1]))] = t
+								if m[2] != "" && !strings.EqualFold(m[2], "ON") {
+									out[strings.ToLower(m[2])] = t
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	walk(e)
+	return out
 }
 
 func tableFromTypeExpr(e ast.Expr, cat *indexer.Catalog) *indexer.Table {
@@ -508,11 +619,22 @@ func (fa *FileAnalysis) Completion(goOff int, cat *indexer.Catalog) ([]map[strin
 		if sp.Table == nil {
 			return nil, false
 		}
-		for _, c := range sp.Table.Columns {
+		targetTable := sp.Table
+		relOff := goOff - sp.Start
+		if relOff >= 0 && relOff <= len(sp.Text) {
+			if qm := ormQualRe.FindStringSubmatch(sp.Text[:relOff]); qm != nil {
+				if qt := sp.resolveTable(qm[1]); qt != nil {
+					targetTable = qt
+				} else {
+					return nil, false
+				}
+			}
+		}
+		for _, c := range targetTable.Columns {
 			items = append(items, map[string]any{
 				"label": c.Name, "kind": 5,
 				"detail":        colTypeDetail(c),
-				"documentation": map[string]any{"kind": "markdown", "value": colDocMD(sp.Table, c)},
+				"documentation": map[string]any{"kind": "markdown", "value": colDocMD(targetTable, c)},
 			})
 		}
 		if sp.Kind == SpanORMOrder {
@@ -649,8 +771,15 @@ func (fa *FileAnalysis) Hover(goOff int, cat *indexer.Catalog) (md string, start
 		if w == "" {
 			return "", 0, 0, false
 		}
-		if col := sp.Table.Column(w); col != nil {
-			return colDocMD(sp.Table, col), sp.Start + ws, sp.Start + we, true
+		targetTable := sp.Table
+		if ws > 0 && sp.Text[ws-1] == '.' {
+			qw, _, _ := wordAt(sp.Text, ws-2)
+			if qt := sp.resolveTable(qw); qt != nil {
+				targetTable = qt
+			}
+		}
+		if col := targetTable.Column(w); col != nil {
+			return colDocMD(targetTable, col), sp.Start + ws, sp.Start + we, true
 		}
 
 	case SpanORMRelation:
@@ -726,8 +855,15 @@ func (fa *FileAnalysis) Definition(goOff int, cat *indexer.Catalog) []indexer.Lo
 		if sp.Table == nil {
 			return nil
 		}
-		w, _, _ := wordAt(sp.Text, relOff)
-		if col := sp.Table.Column(w); col != nil {
+		w, ws, _ := wordAt(sp.Text, relOff)
+		targetTable := sp.Table
+		if ws > 0 && sp.Text[ws-1] == '.' {
+			qw, _, _ := wordAt(sp.Text, ws-2)
+			if qt := sp.resolveTable(qw); qt != nil {
+				targetTable = qt
+			}
+		}
+		if col := targetTable.Column(w); col != nil {
 			add(col.Loc)
 			add(col.MigLoc)
 		}
@@ -783,18 +919,32 @@ func (fa *FileAnalysis) Diagnostics(cat *indexer.Catalog) []rawsql.Diag {
 	for _, sp := range fa.Spans {
 		switch sp.Kind {
 		case SpanORMColumn, SpanPatchKey:
-			if sp.Table == nil || strings.Contains(sp.Text, "(") || strings.Contains(sp.Text, "*") || strings.Contains(sp.Text, " ") {
+			if sp.Table == nil || strings.Contains(sp.Text, "(") || strings.Contains(sp.Text, "*") {
 				continue
 			}
 			for _, part := range strings.Split(sp.Text, ",") {
-				col := strings.TrimSpace(part)
-				if i := strings.LastIndexByte(col, '.'); i >= 0 {
-					col = col[i+1:]
+				colExpr := strings.TrimSpace(part)
+				if colExpr == "" {
+					continue
 				}
-				if col != "" && sp.Table.Column(col) == nil {
+				// Strip column alias: `col AS alias` or `col alias`
+				fields := strings.Fields(colExpr)
+				col := fields[0]
+				if len(fields) > 1 && !(len(fields) == 2 || (len(fields) == 3 && strings.EqualFold(fields[1], "AS"))) {
+					continue
+				}
+				targetTable := sp.Table
+				if i := strings.LastIndexByte(col, '.'); i >= 0 {
+					qual := col[:i]
+					col = col[i+1:]
+					if qt := sp.resolveTable(qual); qt != nil {
+						targetTable = qt
+					}
+				}
+				if col != "" && targetTable.Column(col) == nil {
 					out = append(out, rawsql.Diag{
 						Start: sp.Start, End: sp.End, Severity: 1,
-						Message: fmt.Sprintf("Column '%s' does not exist on table '%s'", col, sp.Table.Name),
+						Message: fmt.Sprintf("Column '%s' does not exist on table '%s'", col, targetTable.Name),
 					})
 				}
 			}
@@ -833,10 +983,17 @@ func (fa *FileAnalysis) Diagnostics(cat *indexer.Catalog) []rawsql.Diag {
 				if m[1] < len(masked) && (masked[m[1]] == '(' || masked[m[1]] == '.') {
 					continue
 				}
-				if sp.Table.Column(w) == nil {
+				targetTable := sp.Table
+				if m[0] > 0 && masked[m[0]-1] == '.' {
+					qw, _, _ := wordAt(masked, m[0]-2)
+					if qt := sp.resolveTable(qw); qt != nil {
+						targetTable = qt
+					}
+				}
+				if targetTable.Column(w) == nil {
 					out = append(out, rawsql.Diag{
 						Start: sp.Start + m[0], End: sp.Start + m[1], Severity: 1,
-						Message: fmt.Sprintf("Column '%s' does not exist on table '%s'", w, sp.Table.Name),
+						Message: fmt.Sprintf("Column '%s' does not exist on table '%s'", w, targetTable.Name),
 					})
 				}
 			}

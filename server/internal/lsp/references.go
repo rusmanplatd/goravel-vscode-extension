@@ -48,10 +48,25 @@ func (s *Server) references(raw json.RawMessage) any {
 	// 2. Check Raw SQL reference
 	if targetConfigKey == "" && targetRuleName == "" && targetTable == "" {
 		if _, _, _, _, d, v, sc, rok := s.resolve(raw); rok {
-			if ref := d.RefAt(v, sc); ref != nil && ref.Table != nil {
-				targetTable = ref.Table.Name
-				if ref.Column != nil {
-					targetColumn = ref.Column.Name
+			if ref := d.RefAt(v, sc); ref != nil {
+				if ref.ColAlias != nil && ref.Table == nil {
+					var aliasLocs []LocationT
+					for _, r := range d.Refs(sc) {
+						if r.ColAlias != nil && strings.EqualFold(r.ColAlias.Name, ref.ColAlias.Name) {
+							if g1, ok1 := d.ToGo(r.VStart); ok1 {
+								if g2, ok2 := d.ToGo(r.VEnd); ok2 {
+									aliasLocs = append(aliasLocs, LocationT{uri, Range{offsetToPos(text, g1), offsetToPos(text, g2)}})
+								}
+							}
+						}
+					}
+					return aliasLocs
+				}
+				if ref.Table != nil {
+					targetTable = ref.Table.Name
+					if ref.Column != nil {
+						targetColumn = ref.Column.Name
+					}
 				}
 			}
 		}

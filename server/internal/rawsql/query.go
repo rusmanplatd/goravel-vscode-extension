@@ -14,8 +14,12 @@ type OutCol struct {
 	Name      string // output name (alias or column)
 	Qualifier string // table alias, if `q.col`
 	SrcCol    string // source column, if a plain column reference
-	VStart    int
-	VEnd      int
+	Expr      string // expression text (e.g., "p.name", "COUNT(*)")
+	IsAlias   bool   // true when explicitly aliased
+	VStart    int    // virtual start of output name (alias if IsAlias, else column)
+	VEnd      int    // virtual end of output name
+	SrcVStart int    // virtual start of source column when IsAlias
+	SrcVEnd   int    // virtual end of source column when IsAlias
 }
 
 // QueryCall is a facades.DB().Select/Insert/Update/... or facades.Orm().Query().Raw/... call.
@@ -206,9 +210,10 @@ func isDBOrOrmReceiver(e ast.Expr) bool {
 }
 
 var (
-	selectRe = regexp.MustCompile(`(?i)^\s*SELECT\b(\s+DISTINCT\b)?`)
-	itemRe   = regexp.MustCompile(`(?is)^(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?"?(\w+)"?)?$`)
-	asRe     = regexp.MustCompile(`(?is)\sAS\s+"?(\w+)"?$`)
+	selectRe     = regexp.MustCompile(`(?i)^\s*SELECT\b(\s+DISTINCT\b)?`)
+	itemRe       = regexp.MustCompile(`(?is)^(?:(\w+)\.)?(\w+)(?:\s+(?:AS\s+)?"?(\w+)"?)?$`)
+	asRe         = regexp.MustCompile(`(?is)\sAS\s+"?(\w+)"?$`)
+	implicitAsRe = regexp.MustCompile(`(?is)\)\s+"?([A-Za-z_]\w*)"?$`)
 )
 
 // ParseSelectList extracts output columns from a top-level SELECT.
@@ -262,15 +267,43 @@ func ParseSelectList(text string) (cols []OutCol, star bool) {
 			q, src := sub(trim, mm, 1), sub(trim, mm, 2)
 			name := src
 			ns, ne := mm[4], mm[5]
+			isAlias := false
+			srcS, srcE := 0, 0
+			expr := trim
 			if a := sub(trim, mm, 3); a != "" {
 				name = a
+				isAlias = true
+				srcS, srcE = lead+mm[4], lead+mm[5]
 				ns, ne = mm[6], mm[7]
+				if q != "" {
+					expr = q + "." + src
+				} else {
+					expr = src
+				}
 			}
-			cols = append(cols, OutCol{Name: name, Qualifier: strings.ToLower(q), SrcCol: src, VStart: lead + ns, VEnd: lead + ne})
+			cols = append(cols, OutCol{
+				Name: name, Qualifier: strings.ToLower(q), SrcCol: src,
+				Expr: expr, IsAlias: isAlias,
+				VStart: lead + ns, VEnd: lead + ne,
+				SrcVStart: srcS, SrcVEnd: srcE,
+			})
 			continue
 		}
 		if am := asRe.FindStringSubmatchIndex(trim); am != nil {
-			cols = append(cols, OutCol{Name: trim[am[2]:am[3]], VStart: lead + am[2], VEnd: lead + am[3]})
+			cols = append(cols, OutCol{
+				Name: trim[am[2]:am[3]], Expr: strings.TrimSpace(trim[:am[0]]),
+				IsAlias: true, VStart: lead + am[2], VEnd: lead + am[3],
+			})
+			continue
+		}
+		if im := implicitAsRe.FindStringSubmatchIndex(trim); im != nil {
+			alias := trim[im[2]:im[3]]
+			if !notAlias[strings.ToLower(alias)] {
+				cols = append(cols, OutCol{
+					Name: alias, Expr: strings.TrimSpace(trim[:im[0]+1]),
+					IsAlias: true, VStart: lead + im[2], VEnd: lead + im[3],
+				})
+			}
 		}
 	}
 	return cols, star

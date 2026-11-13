@@ -79,6 +79,14 @@ func (t *Table) Column(name string) *Column {
 	if t == nil {
 		return nil
 	}
+	if t.byName == nil {
+		for _, c := range t.Columns {
+			if strings.EqualFold(c.Name, name) {
+				return c
+			}
+		}
+		return nil
+	}
 	return t.byName[strings.ToLower(name)]
 }
 
