@@ -20,8 +20,9 @@ type CompItem struct {
 	Kind   int // 5 Field, 10 Property, 14 Keyword, 17 File
 }
 
-// TextEdit represents a byte-offset replacement in the current document.
+// TextEdit represents a byte-offset replacement in the current document (or File when non-empty).
 type TextEdit struct {
+	File       string // optional target file path for cross-file edits
 	Start, End int
 	NewText    string
 }

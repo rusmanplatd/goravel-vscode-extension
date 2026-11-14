@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -256,8 +257,37 @@ func parseDelimitedRoutines(c *Catalog, out, sep string) {
 	}
 }
 
+var sqlPlaceholderRe = regexp.MustCompile(`(\$\d+|\?|\B@[A-Za-z_]\w*)`)
+
+// SanitizeSQLPlaceholders replaces bind parameters ($1, ?, @p1) outside single-quoted literals with safe dummy literals for EXPLAIN / Preview.
+func SanitizeSQLPlaceholders(sqlText string) string {
+	var out strings.Builder
+	inQuote := false
+	i := 0
+	for i < len(sqlText) {
+		ch := sqlText[i]
+		if ch == '\'' {
+			inQuote = !inQuote
+			out.WriteByte(ch)
+			i++
+			continue
+		}
+		if !inQuote {
+			if m := sqlPlaceholderRe.FindStringIndex(sqlText[i:]); m != nil && m[0] == 0 {
+				out.WriteString("'1'")
+				i += m[1]
+				continue
+			}
+		}
+		out.WriteByte(ch)
+		i++
+	}
+	return out.String()
+}
+
 // ExplainQuery runs EXPLAIN on a SQL query when a supported database is configured.
 func ExplainQuery(c *Catalog, sqlText string) (string, error) {
+	sqlText = SanitizeSQLPlaceholders(sqlText)
 	cfg := ResolveDBConfig(c)
 	if err := cfg.validate(); err != nil {
 		return "", err
@@ -301,7 +331,7 @@ func ExplainQuery(c *Catalog, sqlText string) (string, error) {
 
 // PreviewQuery executes a read-only SELECT query (capped at 20 rows) and returns JSON array string.
 func PreviewQuery(c *Catalog, sqlText string) (string, error) {
-	trimmed := strings.TrimSpace(sqlText)
+	trimmed := strings.TrimSpace(SanitizeSQLPlaceholders(sqlText))
 	up := strings.ToUpper(trimmed)
 	if !strings.HasPrefix(up, "SELECT") && !strings.HasPrefix(up, "WITH") {
 		return "", fmt.Errorf("preview only supports SELECT or WITH queries")

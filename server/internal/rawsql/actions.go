@@ -2,6 +2,10 @@ package rawsql
 
 import (
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"os"
 	"regexp"
 	"strings"
 
@@ -117,6 +121,91 @@ func GenerateRowStruct(fi *FileInfo, cat *indexer.Catalog, goOff int) (insertAt 
 			text = "// NOTE: ensure imports: " + strings.Join(imports, ", ") + "\n" + text
 		}
 		return q.FuncStart, text, name, true
+	}
+	return
+}
+
+// AddMissingScanFields offers a quick fix to add missing selected SQL columns to DestStruct.
+func AddMissingScanFields(fi *FileInfo, cat *indexer.Catalog, goOff int) (targetFile string, insertAt int, newText, title string, ok bool) {
+	if fi == nil || cat == nil {
+		return
+	}
+	for _, q := range fi.Queries {
+		if q.DestStruct == "" || q.Star || goOff < q.CallStart || goOff > q.CallEnd {
+			continue
+		}
+		st := cat.Struct(q.DestStruct)
+		if st == nil || !st.Loc.Valid() {
+			continue
+		}
+		sc := fi.BuildScope(q.Doc, cat)
+		outer := q.NullableAliases()
+		var missing []OutCol
+		for _, c := range q.Cols {
+			if st.Has(c.Name) == nil {
+				missing = append(missing, c)
+			}
+		}
+		if len(missing) == 0 {
+			continue
+		}
+		b, err := os.ReadFile(st.Loc.File)
+		if err != nil {
+			continue
+		}
+		fset := token.NewFileSet()
+		f, err := parser.ParseFile(fset, st.Loc.File, b, 0)
+		if err != nil || f == nil {
+			continue
+		}
+		rbrace := -1
+		for _, d := range f.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok {
+				continue
+			}
+			for _, sp := range gd.Specs {
+				ts, ok := sp.(*ast.TypeSpec)
+				if !ok || ts.Name == nil || ts.Name.Name != q.DestStruct {
+					continue
+				}
+				if stType, ok := ts.Type.(*ast.StructType); ok && stType.Fields != nil {
+					rbrace = fset.Position(stType.Fields.Closing).Offset
+				}
+			}
+		}
+		if rbrace < 0 {
+			continue
+		}
+		var lines []string
+		for _, c := range missing {
+			goType, null := "string", false
+			var col *indexer.Column
+			if c.SrcCol != "" {
+				if c.Qualifier != "" && sc[c.Qualifier] != nil {
+					col = sc[c.Qualifier].Column(c.SrcCol)
+				} else {
+					for _, t := range sc.Tables() {
+						if col = t.Column(c.SrcCol); col != nil {
+							break
+						}
+					}
+				}
+			}
+			if col != nil {
+				goType = strings.TrimPrefix(col.GoType, "*")
+				if goType == "" {
+					goType = sqlToGo(col.SQLType)
+				}
+				null = col.Nullable || outer[c.Qualifier]
+			}
+			if null && !strings.HasPrefix(goType, "*") && !strings.Contains(goType, "Null") && goType != "any" {
+				goType = "*" + goType
+			}
+			lines = append(lines, fmt.Sprintf("\t%s %s `gorm:\"column:%s\" json:\"%s\" db:\"%s\"`", Pascal(c.Name), goType, c.Name, c.Name, c.Name))
+		}
+		return st.Loc.File, rbrace, strings.Join(lines, "\n") + "\n",
+			fmt.Sprintf("Add %d missing scan field(s) to %s", len(lines), q.DestStruct), true
 	}
 	return
 }

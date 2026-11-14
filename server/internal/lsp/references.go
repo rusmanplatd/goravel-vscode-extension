@@ -20,15 +20,21 @@ func (s *Server) references(raw json.RawMessage) any {
 
 	var targetConfigKey string
 	var targetRuleName string
+	var targetLangKey string
+	var targetGateAbility string
 	var targetTable, targetColumn string
 
-	// 1. Check ORM / Config / Validation spans
+	// 1. Check ORM / Config / Validation / Lang / Gate spans
 	fa := orm.AnalyzeFile(path, []byte(text), s.cat)
 	if sp := fa.SpanAt(off); sp != nil {
 		relOff := off - sp.Start
 		switch sp.Kind {
 		case orm.SpanConfigKey:
 			targetConfigKey = sp.Text
+		case orm.SpanLangKey:
+			targetLangKey = sp.Text
+		case orm.SpanGateAbility:
+			targetGateAbility = sp.Text
 		case orm.SpanRuleValue:
 			rname, _, _ := ruleNameAt(sp.Text, relOff)
 			if rname != "" {
@@ -46,7 +52,7 @@ func (s *Server) references(raw json.RawMessage) any {
 	}
 
 	// 2. Check Raw SQL reference
-	if targetConfigKey == "" && targetRuleName == "" && targetTable == "" {
+	if targetConfigKey == "" && targetRuleName == "" && targetLangKey == "" && targetGateAbility == "" && targetTable == "" {
 		if _, _, _, _, d, v, sc, rok := s.resolve(raw); rok {
 			if ref := d.RefAt(v, sc); ref != nil {
 				if ref.ColAlias != nil && ref.Table == nil {
@@ -112,17 +118,23 @@ func (s *Server) references(raw json.RawMessage) any {
 		}
 	}
 
-	if targetConfigKey == "" && targetRuleName == "" && targetTable == "" {
+	if targetConfigKey == "" && targetRuleName == "" && targetLangKey == "" && targetGateAbility == "" && targetTable == "" {
 		return nil
 	}
 
 	var locs []LocationT
 	scanFile := func(fpath, content string) {
 		furi := pathToURI(fpath)
-		if targetConfigKey != "" || targetRuleName != "" || targetColumn != "" {
+		if targetConfigKey != "" || targetRuleName != "" || targetLangKey != "" || targetGateAbility != "" || targetColumn != "" {
 			ffa := orm.AnalyzeFile(fpath, []byte(content), s.cat)
 			for _, sp := range ffa.Spans {
 				if targetConfigKey != "" && sp.Kind == orm.SpanConfigKey && sp.Text == targetConfigKey {
+					locs = append(locs, LocationT{furi, Range{offsetToPos(content, sp.Start), offsetToPos(content, sp.End)}})
+				}
+				if targetLangKey != "" && sp.Kind == orm.SpanLangKey && sp.Text == targetLangKey {
+					locs = append(locs, LocationT{furi, Range{offsetToPos(content, sp.Start), offsetToPos(content, sp.End)}})
+				}
+				if targetGateAbility != "" && sp.Kind == orm.SpanGateAbility && sp.Text == targetGateAbility {
 					locs = append(locs, LocationT{furi, Range{offsetToPos(content, sp.Start), offsetToPos(content, sp.End)}})
 				}
 				if targetRuleName != "" && sp.Kind == orm.SpanRuleValue {

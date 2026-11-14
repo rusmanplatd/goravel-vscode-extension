@@ -10,6 +10,7 @@ import (
 	"go/token"
 	"io"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -156,6 +157,7 @@ func (s *Server) dispatch(m *message) {
 				"hoverProvider":      true,
 				"definitionProvider": true,
 				"referencesProvider": true,
+				"renameProvider":     true,
 				"codeActionProvider": true,
 				"codeLensProvider":   map[string]any{"resolveProvider": false},
 				"inlayHintProvider":  true,
@@ -167,7 +169,7 @@ func (s *Server) dispatch(m *message) {
 					"full": true,
 				},
 			},
-			"serverInfo": map[string]any{"name": "goravel-lsp", "version": "0.2.0"},
+			"serverInfo": map[string]any{"name": "goravel-lsp", "version": "0.6.0"},
 		})
 	case "shutdown":
 		s.reply(m.ID, nil)
@@ -249,6 +251,8 @@ func (s *Server) dispatch(m *message) {
 		s.reply(m.ID, s.definition(m.Params))
 	case "textDocument/references":
 		s.reply(m.ID, s.references(m.Params))
+	case "textDocument/rename":
+		s.reply(m.ID, s.rename(m.Params))
 	case "textDocument/codeLens":
 		s.reply(m.ID, s.codeLens(m.Params))
 	case "textDocument/inlayHint":
@@ -263,6 +267,10 @@ func (s *Server) dispatch(m *message) {
 		s.reply(m.ID, s.previewQuery(m.Params))
 	case "goravel/routeSample":
 		s.reply(m.ID, s.routeSample(m.Params))
+	case "goravel/registerBootstrap":
+		s.reply(m.ID, s.registerBootstrap(m.Params))
+	case "goravel/erDiagram":
+		s.reply(m.ID, s.erDiagram())
 	default:
 		if len(m.ID) > 0 && m.Method != "" {
 			s.send(map[string]any{"jsonrpc": "2.0", "id": m.ID, "error": &rpcError{-32601, "method not found: " + m.Method}})
@@ -281,8 +289,15 @@ func shouldReindex(path string) bool {
 		strings.Contains(path, "/app/http/controllers/") ||
 		strings.Contains(path, "/app/http/requests/") ||
 		strings.Contains(path, "/app/http/middleware/") ||
+		strings.Contains(path, "/app/events/") ||
+		strings.Contains(path, "/app/listeners/") ||
+		strings.Contains(path, "/app/jobs/") ||
+		strings.Contains(path, "/app/providers/") ||
 		strings.Contains(path, "/bootstrap/") ||
-		strings.Contains(path, "/resources/views/")
+		strings.Contains(path, "/resources/views/") ||
+		strings.Contains(path, "/lang/") ||
+		strings.HasSuffix(path, "/.env") ||
+		strings.HasSuffix(path, "/.env.example")
 }
 
 func (s *Server) reindex() {
@@ -787,6 +802,21 @@ func (s *Server) codeAction(raw json.RawMessage) any {
 	if at, code, name, ok := rawsql.GenerateRowStruct(fi, s.cat, off); ok {
 		edit("Generate row struct "+name, "refactor.extract", at, at, code)
 	}
+	if targetFile, insertAt, newText, title, ok := rawsql.AddMissingScanFields(fi, s.cat, off); ok {
+		targetURI := pathToURI(targetFile)
+		targetText := text
+		if filepath.Clean(targetFile) != filepath.Clean(uriToPath(uri)) {
+			if b, err := os.ReadFile(targetFile); err == nil {
+				targetText = string(b)
+			}
+		}
+		actions = append(actions, map[string]any{
+			"title": title, "kind": "quickfix",
+			"edit": map[string]any{"changes": map[string]any{targetURI: []map[string]any{{
+				"range": Range{offsetToPos(targetText, insertAt), offsetToPos(targetText, insertAt)}, "newText": newText,
+			}}}},
+		})
+	}
 	if d := fi.DocAt(off); d != nil {
 		cfg := indexer.ResolveDBConfig(s.cat)
 		if cfg.Database != "" && (cfg.Host != "" || cfg.Driver == "sqlite" || cfg.Driver == "sqlite3") {
@@ -817,18 +847,29 @@ func (s *Server) codeAction(raw json.RawMessage) any {
 	fActions = append(fActions, framework.RequestCodeActions(path, text, s.cat, off)...)
 	fActions = append(fActions, framework.ControllerCodeActions(path, text, s.cat, off)...)
 	fActions = append(fActions, framework.DriftCodeActions(path, text, s.cat, off)...)
+	fActions = append(fActions, framework.EnvAndLangCodeActions(path, text, s.cat, off)...)
 	for _, a := range fActions {
-		var changes []map[string]any
+		changesByURI := map[string][]map[string]any{}
 		for _, ed := range a.Edits {
-			changes = append(changes, map[string]any{
-				"range":   Range{offsetToPos(text, ed.Start), offsetToPos(text, ed.End)},
+			targetURI := uri
+			targetText := text
+			if ed.File != "" && filepath.Clean(ed.File) != filepath.Clean(path) {
+				targetURI = pathToURI(ed.File)
+				if doc, ok := s.docs[targetURI]; ok {
+					targetText = doc
+				} else if b, err := os.ReadFile(ed.File); err == nil {
+					targetText = string(b)
+				}
+			}
+			changesByURI[targetURI] = append(changesByURI[targetURI], map[string]any{
+				"range":   Range{offsetToPos(targetText, ed.Start), offsetToPos(targetText, ed.End)},
 				"newText": ed.NewText,
 			})
 		}
 		actions = append(actions, map[string]any{
 			"title": a.Title,
 			"kind":  a.Kind,
-			"edit":  map[string]any{"changes": map[string]any{uri: changes}},
+			"edit":  map[string]any{"changes": changesByURI},
 		})
 	}
 	return actions
@@ -886,6 +927,24 @@ func (s *Server) codeLens(raw json.RawMessage) any {
 			},
 		})
 	}
+	for _, ev := range s.cat.Events {
+		if !ev.Loc.Valid() || filepath.Clean(ev.Loc.File) != path || len(ev.Listeners) == 0 {
+			continue
+		}
+		pos := Position{ev.Loc.Line, ev.Loc.Col}
+		var args []any
+		if len(ev.ListLocs) > 0 && ev.ListLocs[0].Valid() {
+			args = []any{ev.ListLocs[0].File, ev.ListLocs[0].Line, ev.ListLocs[0].Col}
+		}
+		lenses = append(lenses, map[string]any{
+			"range": Range{pos, pos},
+			"command": map[string]any{
+				"title":     fmt.Sprintf("$(broadcast) %d Listener(s): %s", len(ev.Listeners), strings.Join(ev.Listeners, ", ")),
+				"command":   "goravel.openLocation",
+				"arguments": args,
+			},
+		})
+	}
 	if strings.HasSuffix(path, "_test.go") {
 		if text, ok := s.docs[p.TextDocument.URI]; ok {
 			fset := token.NewFileSet()
@@ -929,7 +988,8 @@ func (s *Server) inlayHint(raw json.RawMessage) any {
 	if !ok || !strings.HasSuffix(uri, ".go") {
 		return nil
 	}
-	fa := orm.AnalyzeFile(uriToPath(uri), []byte(text), s.cat)
+	path := uriToPath(uri)
+	fa := orm.AnalyzeFile(path, []byte(text), s.cat)
 	var hints []map[string]any
 	for _, h := range fa.InlayHints(s.cat) {
 		hints = append(hints, map[string]any{
@@ -939,7 +999,15 @@ func (s *Server) inlayHint(raw json.RawMessage) any {
 			"paddingLeft": true,
 		})
 	}
-	for _, h := range framework.ScheduleInlayHints(uriToPath(uri), text) {
+	for _, h := range framework.ScheduleInlayHints(path, text) {
+		hints = append(hints, map[string]any{
+			"position":    offsetToPos(text, h.Offset),
+			"label":       h.Label,
+			"kind":        2,
+			"paddingLeft": true,
+		})
+	}
+	for _, h := range framework.RouteInlayHints(path, text, s.cat) {
 		hints = append(hints, map[string]any{
 			"position":    offsetToPos(text, h.Offset),
 			"label":       h.Label,
@@ -1023,8 +1091,116 @@ func (s *Server) overview() any {
 		"commands":     s.cat.Commands,
 		"seeders":      s.cat.Seeders,
 		"schedules":    s.cat.Schedules,
+		"events":       s.cat.Events,
+		"jobs":         s.cat.Jobs,
 		"unregistered": s.cat.Unregistered,
 	}
+}
+
+func (s *Server) registerBootstrap(raw json.RawMessage) any {
+	var p struct {
+		File string `json:"file"`
+	}
+	_ = json.Unmarshal(raw, &p)
+	clean := filepath.Clean(p.File)
+	unreg := s.cat.UnregisteredByFile[clean]
+	if unreg == nil {
+		return map[string]any{"ok": false, "error": "Component is already registered or not found"}
+	}
+	act, ok := framework.ResolveBootstrapRegistrationAction(s.cat, unreg)
+	if !ok || len(act.Edits) == 0 {
+		return map[string]any{"ok": false, "error": "Could not locate matching bootstrap registration slice"}
+	}
+	ed := act.Edits[0]
+	b, err := os.ReadFile(ed.File)
+	if err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	content := string(b)
+	if ed.Start < 0 || ed.End > len(content) {
+		return map[string]any{"ok": false, "error": "Invalid edit offset"}
+	}
+	updated := content[:ed.Start] + ed.NewText + content[ed.End:]
+	if err := os.WriteFile(ed.File, []byte(updated), 0644); err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	s.reindex()
+	for uri := range s.docs {
+		s.diagnose(uri)
+	}
+	return map[string]any{
+		"ok":         true,
+		"title":      act.Title,
+		"targetFile": ed.File,
+	}
+}
+
+func (s *Server) erDiagram() any {
+	var b strings.Builder
+	b.WriteString("erDiagram\n")
+	names := s.cat.TableNames()
+	seenRel := map[string]bool{}
+	for _, n := range names {
+		t := s.cat.Table(n)
+		if t == nil {
+			continue
+		}
+		fmt.Fprintf(&b, "  %s {\n", sanitizeMermaidIdent(t.Name))
+		for _, c := range t.Columns {
+			typ := sanitizeMermaidIdent(colDetail(t, c))
+			if typ == "" {
+				typ = "string"
+			}
+			pkFk := ""
+			if strings.EqualFold(c.Name, "id") {
+				pkFk = " PK"
+			} else if c.ForeignKey != "" {
+				pkFk = " FK"
+			}
+			fmt.Fprintf(&b, "    %s %s%s\n", typ, sanitizeMermaidIdent(c.Name), pkFk)
+		}
+		b.WriteString("  }\n")
+		for _, r := range t.Relations {
+			if r.TargetTable == "" {
+				continue
+			}
+			relKey := t.Name + "->" + r.TargetTable + ":" + r.ForeignKey
+			if seenRel[relKey] {
+				continue
+			}
+			seenRel[relKey] = true
+			lbl := r.ForeignKey
+			if lbl == "" {
+				lbl = r.Name
+			}
+			fmt.Fprintf(&b, "  %s }o--|| %s : %q\n",
+				sanitizeMermaidIdent(t.Name),
+				sanitizeMermaidIdent(r.TargetTable),
+				lbl,
+			)
+		}
+	}
+	return map[string]any{
+		"mermaid": b.String(),
+		"tables":  len(names),
+	}
+}
+
+func sanitizeMermaidIdent(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' {
+			b.WriteByte(ch)
+		} else {
+			b.WriteByte('_')
+		}
+	}
+	res := strings.Trim(b.String(), "_")
+	if res == "" {
+		return "unknown"
+	}
+	return res
 }
 
 func (s *Server) explainQuery(raw json.RawMessage) any {

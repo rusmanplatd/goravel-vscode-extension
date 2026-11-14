@@ -2,7 +2,7 @@
   "name": "goravel-vscode",
   "displayName": "Goravel",
   "description": "Goravel tooling: raw SQL LSP, ORM query builder intelligence, Config, Routes, Validation Rules, and Artisan CLI for Go projects",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "rusmanplatd",
   "repository": {
     "type": "git",
@@ -40,6 +40,11 @@
           "type": "boolean",
           "default": false,
           "description": "Enable optional live database schema introspection using .env DB_* settings."
+        },
+        "goravel.artisan.command": {
+          "type": "string",
+          "default": "go run . artisan",
+          "description": "Base Artisan CLI command prefix (e.g. 'go run . artisan', './artisan', or 'docker compose exec app go run . artisan')."
         }
       }
     },
@@ -83,6 +88,41 @@
         "icon": "$(refresh)"
       },
       {
+        "command": "goravel.showErDiagram",
+        "title": "Goravel: Show Database ER Diagram",
+        "icon": "$(type-hierarchy-sub)"
+      },
+      {
+        "command": "goravel.showRouteMatrix",
+        "title": "Goravel: Show Route Matrix",
+        "icon": "$(table)"
+      },
+      {
+        "command": "goravel.registerBootstrap",
+        "title": "Goravel: Register in bootstrap/",
+        "icon": "$(add)"
+      },
+      {
+        "command": "goravel.model.openMigration",
+        "title": "Goravel: Open Table Migration",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "goravel.table.preview",
+        "title": "Goravel: Preview Table Data (Top 20)",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "goravel.route.openDefinition",
+        "title": "Goravel: Open Route Registration",
+        "icon": "$(go-to-file)"
+      },
+      {
+        "command": "goravel.route.testRequest",
+        "title": "Goravel: Test Route Request",
+        "icon": "$(send)"
+      },
+      {
         "command": "goravel.artisan.run",
         "title": "Goravel: Run Artisan Command..."
       },
@@ -111,6 +151,38 @@
         "title": "Goravel: Artisan make:seeder"
       },
       {
+        "command": "goravel.artisan.makeEvent",
+        "title": "Goravel: Artisan make:event"
+      },
+      {
+        "command": "goravel.artisan.makeListener",
+        "title": "Goravel: Artisan make:listener"
+      },
+      {
+        "command": "goravel.artisan.makeJob",
+        "title": "Goravel: Artisan make:job"
+      },
+      {
+        "command": "goravel.artisan.makeObserver",
+        "title": "Goravel: Artisan make:observer"
+      },
+      {
+        "command": "goravel.artisan.makePolicy",
+        "title": "Goravel: Artisan make:policy"
+      },
+      {
+        "command": "goravel.artisan.makeProvider",
+        "title": "Goravel: Artisan make:provider"
+      },
+      {
+        "command": "goravel.artisan.makeFactory",
+        "title": "Goravel: Artisan make:factory"
+      },
+      {
+        "command": "goravel.artisan.makeTest",
+        "title": "Goravel: Artisan make:test"
+      },
+      {
         "command": "goravel.artisan.migrate",
         "title": "Goravel: Artisan migrate"
       },
@@ -134,9 +206,46 @@
     "menus": {
       "view/title": [
         {
+          "command": "goravel.showErDiagram",
+          "when": "view == goravel.views.models",
+          "group": "navigation@1"
+        },
+        {
+          "command": "goravel.showRouteMatrix",
+          "when": "view == goravel.views.routes",
+          "group": "navigation@1"
+        },
+        {
           "command": "goravel.refreshViews",
           "when": "view =~ /^goravel\\.views\\./",
-          "group": "navigation"
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "goravel.table.preview",
+          "when": "view == goravel.views.models && viewItem == goravelTable",
+          "group": "inline@1"
+        },
+        {
+          "command": "goravel.model.openMigration",
+          "when": "view == goravel.views.models && viewItem == goravelTable",
+          "group": "inline@2"
+        },
+        {
+          "command": "goravel.route.testRequest",
+          "when": "view == goravel.views.routes && viewItem == goravelRoute",
+          "group": "inline@1"
+        },
+        {
+          "command": "goravel.route.openDefinition",
+          "when": "view == goravel.views.routes && viewItem == goravelRoute",
+          "group": "inline@2"
+        },
+        {
+          "command": "goravel.registerBootstrap",
+          "when": "view == goravel.views.commands && viewItem == goravelUnregistered",
+          "group": "inline@1"
         }
       ],
       "explorer/context": [
@@ -161,6 +270,36 @@
           "group": "goravel@1"
         },
         {
+          "command": "goravel.artisan.makeEvent",
+          "when": "resourcePath =~ /\\/app\\/events$/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeListener",
+          "when": "resourcePath =~ /\\/app\\/listeners$/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeJob",
+          "when": "resourcePath =~ /\\/app\\/jobs$/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeObserver",
+          "when": "resourcePath =~ /\\/app\\/observers$/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makePolicy",
+          "when": "resourcePath =~ /\\/app\\/policies$/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeProvider",
+          "when": "resourcePath =~ /\\/app\\/providers$/",
+          "group": "goravel@1"
+        },
+        {
           "command": "goravel.artisan.makeMigration",
           "when": "resourcePath =~ /\\/database\\/migrations([_a-zA-Z0-9-]*)(\\/|$)/",
           "group": "goravel@1"
@@ -168,6 +307,16 @@
         {
           "command": "goravel.artisan.makeSeeder",
           "when": "resourcePath =~ /\\/database\\/seeders$/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeFactory",
+          "when": "resourcePath =~ /\\/database\\/factories$/",
+          "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeTest",
+          "when": "resourcePath =~ /\\/tests$/",
           "group": "goravel@1"
         }
       ]

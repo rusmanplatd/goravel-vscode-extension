@@ -129,6 +129,36 @@ func (t *Table) add(c *Column) {
 	t.Columns = append(t.Columns, c)
 }
 
+func (t *Table) removeColumn(name string) {
+	if t == nil || name == "" {
+		return
+	}
+	key := strings.ToLower(name)
+	if t.byName != nil {
+		delete(t.byName, key)
+	}
+	filtered := t.Columns[:0]
+	for _, c := range t.Columns {
+		if !strings.EqualFold(c.Name, name) {
+			filtered = append(filtered, c)
+		}
+	}
+	t.Columns = filtered
+}
+
+func (t *Table) renameColumn(oldName, newName string) {
+	if t == nil || oldName == "" || newName == "" {
+		return
+	}
+	c := t.Column(oldName)
+	if c == nil {
+		return
+	}
+	t.removeColumn(oldName)
+	c.Name = newName
+	t.add(c)
+}
+
 func (t *Table) addRelation(r *Relation) {
 	for _, existing := range t.Relations {
 		if existing.Name != "" && strings.EqualFold(existing.Name, r.Name) {
@@ -239,12 +269,42 @@ type ScheduleItem struct {
 	Loc    Location `json:"loc"`
 }
 
-// UnregisteredItem describes a migration, seeder, rule, or command not registered in bootstrap/.
+// UnregisteredItem describes a migration, seeder, rule, command, event, listener, or job not registered in bootstrap/ or providers.
 type UnregisteredItem struct {
-	Kind string   `json:"kind"` // migration | seeder | rule | command
-	Name string   `json:"name"`
-	File string   `json:"file"`
-	Loc  Location `json:"loc"`
+	Kind       string   `json:"kind"` // migration | seeder | rule | command | event | listener | job
+	Name       string   `json:"name"`
+	StructName string   `json:"structName,omitempty"`
+	PkgName    string   `json:"pkgName,omitempty"`
+	File       string   `json:"file"`
+	Loc        Location `json:"loc"`
+}
+
+// TranslationEntry describes a localized translation value in lang/<locale>/*.json.
+type TranslationEntry struct {
+	Locale string   `json:"locale"`
+	Value  string   `json:"value"`
+	Loc    Location `json:"loc"`
+}
+
+// GateItem describes an authorization gate defined via facades.Gate().Define("<ability>", ...).
+type GateItem struct {
+	Ability string   `json:"ability"`
+	Loc     Location `json:"loc"`
+}
+
+// EventItem describes an Event struct in app/events and its registered Listeners.
+type EventItem struct {
+	Name      string     `json:"name"`
+	Listeners []string   `json:"listeners,omitempty"`
+	ListLocs  []Location `json:"listLocs,omitempty"`
+	Loc       Location   `json:"loc"`
+}
+
+// JobItem describes a Queue Job struct in app/jobs.
+type JobItem struct {
+	Name      string   `json:"name"`
+	Signature string   `json:"signature"`
+	Loc       Location `json:"loc"`
 }
 
 // TableConstInfo describes an *OriginalTableName constant in app/models.
@@ -267,24 +327,29 @@ type DBFunction struct {
 type Catalog struct {
 	mu                 sync.RWMutex
 	Root               string
-	Tables             map[string]*Table               // by table name (no schema)
-	Models             map[string]*Table               // by Go model name
-	TableConsts        map[string]*TableConstInfo      // by constant identifier name
-	DBFunctions        []*DBFunction                   // live DB functions & procedures
-	Structs            map[string]*StructInfo          // all structs in app/models and app/http/requests
-	Configs            map[string]*ConfigItem          // by dot key (e.g. "jwt.secret")
-	EnvVars            map[string]string               // by env var name from .env*
-	Routes             []*RouteItem                    // all registered routes
-	Rules              map[string]*RuleItem            // by rule signature
-	Migrations         []*MigrationItem                // all migration files
-	Commands           []*CommandItem                  // custom Artisan commands
-	Controllers        map[string]map[string]Location  // Controller -> Method -> Location
-	Views              map[string]Location             // relative view path (e.g. "auth/signin.tmpl") -> Location
-	Middleware         map[string]Location             // middleware name -> Location
-	Seeders            []*SeederItem                   // database seeders
-	Schedules          []*ScheduleItem                 // scheduled tasks
-	Unregistered       []*UnregisteredItem             // items not wired in bootstrap/
-	UnregisteredByFile map[string]*UnregisteredItem    // file path -> unregistered item
+	Tables             map[string]*Table                         // by table name (no schema)
+	Models             map[string]*Table                         // by Go model name
+	TableConsts        map[string]*TableConstInfo                // by constant identifier name
+	DBFunctions        []*DBFunction                             // live DB functions & procedures
+	Structs            map[string]*StructInfo                    // all structs in app/models and app/http/requests
+	Configs            map[string]*ConfigItem                    // by dot key (e.g. "jwt.secret")
+	EnvVars            map[string]string                         // by env var name from .env*
+	Routes             []*RouteItem                              // all registered routes
+	Rules              map[string]*RuleItem                      // by rule signature
+	Migrations         []*MigrationItem                          // all migration files
+	Commands           []*CommandItem                            // custom Artisan commands
+	Controllers        map[string]map[string]Location            // Controller -> Method -> Location
+	Views              map[string]Location                       // relative view path (e.g. "auth/signin.tmpl") -> Location
+	Middleware         map[string]Location                       // middleware name -> Location
+	Seeders            []*SeederItem                             // database seeders
+	Schedules          []*ScheduleItem                           // scheduled tasks
+	Translations       map[string]map[string]TranslationEntry    // key -> locale -> TranslationEntry
+	Gates              map[string]*GateItem                      // ability -> GateItem
+	Events             []*EventItem                              // indexed events and their listeners
+	Listeners          map[string]Location                       // ListenerStruct -> Location
+	Jobs               []*JobItem                                // indexed queue jobs
+	Unregistered       []*UnregisteredItem                       // items not wired in bootstrap/
+	UnregisteredByFile map[string]*UnregisteredItem              // file path -> unregistered item
 }
 
 func NewCatalog() *Catalog {
@@ -299,6 +364,9 @@ func NewCatalog() *Catalog {
 		Controllers:        map[string]map[string]Location{},
 		Views:              map[string]Location{},
 		Middleware:         map[string]Location{},
+		Translations:       map[string]map[string]TranslationEntry{},
+		Gates:              map[string]*GateItem{},
+		Listeners:          map[string]Location{},
 		UnregisteredByFile: map[string]*UnregisteredItem{},
 	}
 	seedBuiltinRules(c)
@@ -400,6 +468,30 @@ func (c *Catalog) RoutesForHandler(controller, action string) []*RouteItem {
 	return out
 }
 
+// TranslationKeys returns all sorted translation keys in lang/.
+func (c *Catalog) TranslationKeys() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, 0, len(c.Translations))
+	for k := range c.Translations {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// GateAbilities returns all sorted authorization gate ability names.
+func (c *Catalog) GateAbilities() []string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	out := make([]string, 0, len(c.Gates))
+	for k := range c.Gates {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Build indexes the project at root.
 func Build(root string) *Catalog {
 	c := NewCatalog()
@@ -418,6 +510,9 @@ func Build(root string) *Catalog {
 	indexMiddleware(c, root)
 	indexSeeders(c, root)
 	indexSchedules(c, root)
+	indexTranslations(c, root)
+	indexGates(c, root)
+	indexEventsAndJobs(c, root)
 	indexBootstrapRegistrations(c, root)
 	indexLiveDBIfEnabled(c, root)
 	return c

@@ -6,6 +6,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -169,10 +170,11 @@ func ControllerCodeActions(path, src string, cat *indexer.Catalog, goOff int) []
 		}
 		fStart := fset.Position(fd.Pos()).Offset
 		fEnd := fset.Position(fd.End()).Offset
-		if goOff < fStart || goOff > fEnd {
-			continue
+		docStart := fStart
+		if fd.Doc != nil {
+			docStart = fset.Position(fd.Doc.Pos()).Offset
 		}
-		if fd.Doc != nil && strings.Contains(fd.Doc.Text(), "@Router") {
+		if goOff < docStart || goOff > fEnd {
 			continue
 		}
 		ctrl := receiverTypeName(fd.Recv)
@@ -181,6 +183,34 @@ func ControllerCodeActions(path, src string, cat *indexer.Catalog, goOff int) []
 			continue
 		}
 		r := routes[0]
+		if fd.Doc != nil && strings.Contains(fd.Doc.Text(), "@Router") {
+			for _, cmt := range fd.Doc.List {
+				if m := swagRouterRe.FindStringSubmatchIndex(cmt.Text); m != nil {
+					swPath, swMethod := cmt.Text[m[2]:m[3]], strings.ToUpper(cmt.Text[m[4]:m[5]])
+					matched := false
+					for _, rt := range routes {
+						if normalizeSwagPath(rt.Path) == normalizeSwagPath(swPath) && (rt.Method == "ANY" || rt.Method == swMethod) {
+							matched = true
+							break
+						}
+					}
+					if !matched {
+						cOff := fset.Position(cmt.Pos()).Offset
+						newRouter := fmt.Sprintf("@Router %s [%s]", r.Path, strings.ToLower(r.Method))
+						return []CodeAction{{
+							Title: fmt.Sprintf("Update Swagger @Router to %s [%s]", r.Path, strings.ToLower(r.Method)),
+							Kind:  "quickfix",
+							Edits: []TextEdit{{
+								Start:   cOff + m[0],
+								End:     cOff + m[1],
+								NewText: newRouter,
+							}},
+						}}
+					}
+				}
+			}
+			continue
+		}
 		var b strings.Builder
 		fmt.Fprintf(&b, "// %s godoc\n", fd.Name.Name)
 		fmt.Fprintf(&b, "// @Summary %s\n", fd.Name.Name)
@@ -260,8 +290,131 @@ func RouteAndControllerHover(path, src string, cat *indexer.Catalog, goOff int) 
 				return &HoverResult{Markdown: fmt.Sprintf("**Middleware `%s`**\n\nDefined at `%s:%d`", word, filepath.Base(loc.File), loc.Line+1)}
 			}
 		}
+		clean := filepath.Clean(path)
+		line := strings.Count(src[:goOff], "\n")
+		for _, r := range cat.Routes {
+			if filepath.Clean(r.Loc.File) == clean && r.Loc.Line == line {
+				md := fmt.Sprintf("**Route `%s %s`**\n\n- Handler: `%s`", r.Method, r.Path, r.Handler)
+				if len(r.Middlewares) > 0 {
+					md += "\n- Middlewares: `" + strings.Join(r.Middlewares, "`, `") + "`"
+				}
+				if r.CtrlLoc.Valid() {
+					md += fmt.Sprintf("\n- Controller: `%s:%d`", filepath.Base(r.CtrlLoc.File), r.CtrlLoc.Line+1)
+				}
+				return &HoverResult{Markdown: md}
+			}
+		}
 	}
 	return nil
+}
+
+// RouteInlayHints displays resolved full route paths and middleware chains inline in routes/*.go.
+func RouteInlayHints(path, src string, cat *indexer.Catalog) []InlayHint {
+	if !isRouteFile(path) || cat == nil {
+		return nil
+	}
+	clean := filepath.Clean(path)
+	lines := strings.Split(src, "\n")
+	lineStartOff := make([]int, len(lines))
+	off := 0
+	for i, l := range lines {
+		lineStartOff[i] = off
+		off += len(l) + 1
+	}
+	var out []InlayHint
+	seenLine := map[int]bool{}
+	for _, r := range cat.Routes {
+		if filepath.Clean(r.Loc.File) != clean || r.Loc.Line < 0 || r.Loc.Line >= len(lines) {
+			continue
+		}
+		if seenLine[r.Loc.Line] {
+			continue
+		}
+		seenLine[r.Loc.Line] = true
+		lineText := strings.TrimRight(lines[r.Loc.Line], "\r")
+		endOff := lineStartOff[r.Loc.Line] + len(lineText)
+		mwSuffix := ""
+		if len(r.Middlewares) > 0 {
+			mwSuffix = " [" + strings.Join(r.Middlewares, ", ") + "]"
+		}
+		out = append(out, InlayHint{
+			Offset: endOff,
+			Label:  fmt.Sprintf(" → %s %s%s", r.Method, r.Path, mwSuffix),
+		})
+	}
+	return out
+}
+
+var (
+	envCallRe  = regexp.MustCompile(`\bEnv\(\s*"([^"]+)"`)
+	langCallRe = regexp.MustCompile(`\bLang\([^)]*\)\.Get\(\s*"([^"]+)"`)
+)
+
+// EnvAndLangCodeActions offers adding missing .env variables to .env.example and missing translation keys to lang/*.json.
+func EnvAndLangCodeActions(path, src string, cat *indexer.Catalog, goOff int) []CodeAction {
+	if cat == nil || cat.Root == "" {
+		return nil
+	}
+	var actions []CodeAction
+	for _, m := range envCallRe.FindAllStringSubmatchIndex(src, -1) {
+		if goOff < m[0] || goOff > m[1] {
+			continue
+		}
+		key := src[m[2]:m[3]]
+		if _, ok := cat.EnvVars[key]; !ok && key != "" {
+			envFile := filepath.Join(cat.Root, ".env.example")
+			if _, err := os.Stat(envFile); err != nil {
+				envFile = filepath.Join(cat.Root, ".env")
+			}
+			if b, err := os.ReadFile(envFile); err == nil {
+				endPos := len(b)
+				prefix := ""
+				if endPos > 0 && b[endPos-1] != '\n' {
+					prefix = "\n"
+				}
+				actions = append(actions, CodeAction{
+					Title: fmt.Sprintf("Add '%s=' to %s", key, filepath.Base(envFile)),
+					Kind:  "quickfix",
+					Edits: []TextEdit{{
+						File:    envFile,
+						Start:   endPos,
+						End:     endPos,
+						NewText: fmt.Sprintf("%s%s=\n", prefix, key),
+					}},
+				})
+			}
+		}
+	}
+	for _, m := range langCallRe.FindAllStringSubmatchIndex(src, -1) {
+		if goOff < m[0] || goOff > m[1] {
+			continue
+		}
+		key := src[m[2]:m[3]]
+		if _, ok := cat.Translations[key]; !ok && key != "" {
+			langFile := filepath.Join(cat.Root, "lang", "en.json")
+			if b, err := os.ReadFile(langFile); err == nil {
+				content := string(b)
+				if rbrace := strings.LastIndexByte(content, '}'); rbrace > 0 {
+					trimmed := strings.TrimRight(content[:rbrace], " \t\r\n")
+					comma := ","
+					if strings.HasSuffix(trimmed, "{") {
+						comma = ""
+					}
+					actions = append(actions, CodeAction{
+						Title: fmt.Sprintf("Add translation key %q to lang/en.json", key),
+						Kind:  "quickfix",
+						Edits: []TextEdit{{
+							File:    langFile,
+							Start:   len(trimmed),
+							End:     rbrace,
+							NewText: fmt.Sprintf("%s\n  %q: %q\n", comma, key, key),
+						}},
+					})
+				}
+			}
+		}
+	}
+	return actions
 }
 
 // RouteMiddlewareDefinition jumps from a middleware name in routes/*.go to app/http/middleware/*.go.

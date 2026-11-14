@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"encoding/json"
 	"fmt"
 	"go/ast"
 	"go/token"
@@ -229,6 +230,216 @@ func HumanCron(expr string) string {
 	return fmt.Sprintf("Cron (%s %s %s %s %s)", min, hour, dom, mon, dow)
 }
 
+func indexTranslations(c *Catalog, root string) {
+	langDir := filepath.Join(root, "lang")
+	if _, err := os.Stat(langDir); err != nil {
+		return
+	}
+	_ = filepath.WalkDir(langDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(strings.ToLower(d.Name()), ".json") {
+			return nil
+		}
+		rel, err := filepath.Rel(langDir, p)
+		if err != nil {
+			return nil
+		}
+		relSlash := filepath.ToSlash(rel)
+		parts := strings.Split(relSlash, "/")
+		locale := ""
+		prefix := ""
+		if len(parts) == 1 {
+			locale = strings.TrimSuffix(parts[0], filepath.Ext(parts[0]))
+		} else {
+			locale = parts[0]
+			sub := strings.TrimSuffix(strings.Join(parts[1:], "."), filepath.Ext(parts[len(parts)-1]))
+			if sub != "" {
+				prefix = sub + "."
+			}
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return nil
+		}
+		var raw map[string]any
+		if json.Unmarshal(b, &raw) != nil {
+			return nil
+		}
+		src := string(b)
+		walkTranslationJSON(c, p, src, locale, prefix, raw)
+		return nil
+	})
+}
+
+func walkTranslationJSON(c *Catalog, path, src, locale, prefix string, m map[string]any) {
+	for k, v := range m {
+		fullKey := prefix + k
+		switch val := v.(type) {
+		case string:
+			if c.Translations[fullKey] == nil {
+				c.Translations[fullKey] = map[string]TranslationEntry{}
+			}
+			line := findJSONKeyLine(src, k)
+			c.Translations[fullKey][locale] = TranslationEntry{
+				Locale: locale,
+				Value:  val,
+				Loc:    Location{File: path, Line: line, Col: 0},
+			}
+		case map[string]any:
+			walkTranslationJSON(c, path, src, locale, fullKey+".", val)
+		}
+	}
+}
+
+func findJSONKeyLine(src, key string) int {
+	needle := fmt.Sprintf("%q", key)
+	idx := strings.Index(src, needle)
+	if idx < 0 {
+		return 0
+	}
+	return strings.Count(src[:idx], "\n")
+}
+
+func indexGates(c *Catalog, root string) {
+	var files []*parsedFile
+	files = append(files, walkGoFiles(filepath.Join(root, "app"))...)
+	files = append(files, walkGoFiles(filepath.Join(root, "bootstrap"))...)
+	for _, pf := range files {
+		ast.Inspect(pf.file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) < 1 {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "Define" {
+				return true
+			}
+			if !isGateCallChain(sel.X) {
+				return true
+			}
+			ability := stringLitValue(call.Args[0])
+			if ability != "" {
+				c.Gates[ability] = &GateItem{
+					Ability: ability,
+					Loc:     loc(pf, call.Args[0].Pos()),
+				}
+			}
+			return true
+		})
+	}
+}
+
+func isGateCallChain(e ast.Expr) bool {
+	call, ok := e.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && sel.Sel.Name == "Gate"
+}
+
+func indexEventsAndJobs(c *Catalog, root string) {
+	// 1. Index Listeners in app/listeners
+	listenerFiles := walkGoFiles(filepath.Join(root, "app", "listeners"))
+	for _, pf := range listenerFiles {
+		for _, d := range pf.file.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, sp := range gd.Specs {
+				if ts, ok := sp.(*ast.TypeSpec); ok && ts.Name != nil && ts.Name.IsExported() {
+					c.Listeners[ts.Name.Name] = loc(pf, ts.Name.Pos())
+				}
+			}
+		}
+	}
+
+	// 2. Index Events in app/events
+	eventByName := map[string]*EventItem{}
+	eventFiles := walkGoFiles(filepath.Join(root, "app", "events"))
+	for _, pf := range eventFiles {
+		for _, d := range pf.file.Decls {
+			gd, ok := d.(*ast.GenDecl)
+			if !ok || gd.Tok != token.TYPE {
+				continue
+			}
+			for _, sp := range gd.Specs {
+				if ts, ok := sp.(*ast.TypeSpec); ok && ts.Name != nil && ts.Name.IsExported() {
+					ev := &EventItem{
+						Name: ts.Name.Name,
+						Loc:  loc(pf, ts.Name.Pos()),
+					}
+					c.Events = append(c.Events, ev)
+					eventByName[ev.Name] = ev
+				}
+			}
+		}
+	}
+
+	// 3. Index Jobs in app/jobs
+	jobFiles := walkGoFiles(filepath.Join(root, "app", "jobs"))
+	for _, pf := range jobFiles {
+		for _, d := range pf.file.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Recv == nil || fd.Body == nil || fd.Name.Name != "Signature" {
+				continue
+			}
+			recv := recvName(fd.Recv)
+			if recv != "" {
+				c.Jobs = append(c.Jobs, &JobItem{
+					Name:      recv,
+					Signature: returnString(fd.Body),
+					Loc:       loc(pf, fd.Name.Pos()),
+				})
+			}
+		}
+	}
+
+	// 4. Match Event -> []Listener registrations in app/providers or bootstrap
+	var regFiles []*parsedFile
+	regFiles = append(regFiles, walkGoFiles(filepath.Join(root, "app", "providers"))...)
+	regFiles = append(regFiles, walkGoFiles(filepath.Join(root, "bootstrap"))...)
+	for _, pf := range regFiles {
+		ast.Inspect(pf.file, func(n ast.Node) bool {
+			kv, ok := n.(*ast.KeyValueExpr)
+			if !ok {
+				return true
+			}
+			evName := cleanModelType(exprString(kv.Key))
+			if u, ok := kv.Key.(*ast.UnaryExpr); ok {
+				if cl, ok := u.X.(*ast.CompositeLit); ok {
+					evName = cleanModelType(exprString(cl.Type))
+				}
+			}
+			ev := eventByName[evName]
+			if ev == nil {
+				return true
+			}
+			cl, ok := kv.Value.(*ast.CompositeLit)
+			if !ok {
+				return true
+			}
+			for _, elt := range cl.Elts {
+				lName := ""
+				if u, ok := elt.(*ast.UnaryExpr); ok {
+					if lcl, ok := u.X.(*ast.CompositeLit); ok {
+						lName = cleanModelType(exprString(lcl.Type))
+					}
+				} else if call, ok := elt.(*ast.CallExpr); ok {
+					lName = strings.TrimPrefix(cleanModelType(exprString(call.Fun)), "New")
+				}
+				if lName != "" {
+					ev.Listeners = append(ev.Listeners, lName)
+					if lLoc, ok := c.Listeners[lName]; ok {
+						ev.ListLocs = append(ev.ListLocs, lLoc)
+					}
+				}
+			}
+			return true
+		})
+	}
+}
+
 func indexBootstrapRegistrations(c *Catalog, root string) {
 	bootDir := filepath.Join(root, "bootstrap")
 	if _, err := os.Stat(bootDir); err != nil {
@@ -245,16 +456,33 @@ func indexBootstrapRegistrations(c *Catalog, root string) {
 		}
 		return nil
 	})
+	_ = filepath.WalkDir(filepath.Join(root, "app", "providers"), func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || !strings.HasSuffix(p, ".go") {
+			return nil
+		}
+		if b, err := os.ReadFile(p); err == nil {
+			bootSrc.Write(b)
+			bootSrc.WriteByte('\n')
+		}
+		return nil
+	})
 	allBoot := bootSrc.String()
 	if allBoot == "" {
 		return
 	}
 
-	addUnreg := func(kind, name string, l Location) {
+	addUnreg := func(kind, name, structName, pkgName string, l Location) {
 		if l.File == "" || name == "" {
 			return
 		}
-		it := &UnregisteredItem{Kind: kind, Name: name, File: l.File, Loc: l}
+		it := &UnregisteredItem{
+			Kind:       kind,
+			Name:       name,
+			StructName: structName,
+			PkgName:    pkgName,
+			File:       l.File,
+			Loc:        l,
+		}
 		c.Unregistered = append(c.Unregistered, it)
 		c.UnregisteredByFile[filepath.Clean(l.File)] = it
 	}
@@ -264,18 +492,18 @@ func indexBootstrapRegistrations(c *Catalog, root string) {
 		if m.Loc.File == "" {
 			continue
 		}
-		// Find struct name in migration file (typically M<timestamp><Name>)
 		if b, err := os.ReadFile(m.Loc.File); err == nil {
 			s := string(b)
+			stName, pkgName := firstExportedStructAndPkg(s)
 			if !strings.Contains(allBoot, m.Name) && !containsMigrationStruct(allBoot, s) {
-				addUnreg("migration", m.Name, m.Loc)
+				addUnreg("migration", m.Name, stName, pkgName, m.Loc)
 			}
 		}
 	}
 	// Check seeders
 	for _, s := range c.Seeders {
 		if !strings.Contains(allBoot, s.Name) {
-			addUnreg("seeder", s.Name, s.Loc)
+			addUnreg("seeder", s.Name, s.Name, "seeders", s.Loc)
 		}
 	}
 	// Check custom rules
@@ -283,19 +511,46 @@ func indexBootstrapRegistrations(c *Catalog, root string) {
 		if !r.Custom || !r.Loc.Valid() {
 			continue
 		}
-		// Match struct name in the rule file
 		if b, err := os.ReadFile(r.Loc.File); err == nil {
+			stName, pkgName := firstExportedStructAndPkg(string(b))
 			if !containsAnyExportedType(allBoot, string(b)) {
-				addUnreg("rule", r.Name, r.Loc)
+				addUnreg("rule", r.Name, stName, pkgName, r.Loc)
 			}
 		}
 	}
 	// Check custom commands
 	for _, cmd := range c.Commands {
 		if !strings.Contains(allBoot, cmd.StructName) {
-			addUnreg("command", cmd.Signature, cmd.Loc)
+			addUnreg("command", cmd.Signature, cmd.StructName, "commands", cmd.Loc)
 		}
 	}
+	// Check jobs
+	for _, j := range c.Jobs {
+		if !strings.Contains(allBoot, j.Name) {
+			addUnreg("job", j.Name, j.Name, "jobs", j.Loc)
+		}
+	}
+}
+
+func firstExportedStructAndPkg(fileSrc string) (structName, pkgName string) {
+	for _, line := range strings.Split(fileSrc, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "package ") && pkgName == "" {
+			fields := strings.Fields(line)
+			if len(fields) >= 2 {
+				pkgName = fields[1]
+			}
+		}
+		if strings.HasPrefix(line, "type ") && structName == "" {
+			fields := strings.Fields(line)
+			if len(fields) >= 3 && fields[2] == "struct" || (len(fields) >= 2 && strings.HasSuffix(fields[2], "struct{}") || strings.HasPrefix(fields[2], "struct{")) {
+				structName = fields[1]
+			} else if len(fields) >= 3 && strings.HasPrefix(fields[2], "struct") {
+				structName = fields[1]
+			}
+		}
+	}
+	return
 }
 
 func containsMigrationStruct(bootSrc, migSrc string) bool {
@@ -319,7 +574,7 @@ func containsAnyExportedType(bootSrc, fileSrc string) bool {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "type ") {
 			fields := strings.Fields(line)
-			if len(fields) >= 3 && fields[2] == "struct" {
+			if len(fields) >= 3 && strings.HasPrefix(fields[2], "struct") {
 				if strings.Contains(bootSrc, fields[1]) {
 					return true
 				}

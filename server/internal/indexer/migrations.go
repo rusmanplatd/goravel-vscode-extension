@@ -5,17 +5,23 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 )
 
 var (
 	createRe       = regexp.MustCompile("(?is)CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?(?:`\\s*\\+\\s*(\\w+)\\s*\\+\\s*`|([\\w.\"]+))\\s*\\(")
+	alterAddRe     = regexp.MustCompile("(?im)ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:`\\s*\\+\\s*(\\w+)\\s*\\+\\s*`|([\\w.\"]+))\\s+ADD\\s+(?:COLUMN\\s+)?(?:IF\\s+NOT\\s+EXISTS\\s+)?\"?(\\w+)\"?\\s+([A-Za-z_]+(?:\\s*\\([^)]*\\))?(?:\\s+(?:WITH|WITHOUT)\\s+TIME\\s+ZONE)?[^;,\\n]*)")
+	alterDropRe    = regexp.MustCompile("(?im)ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:`\\s*\\+\\s*(\\w+)\\s*\\+\\s*`|([\\w.\"]+))\\s+DROP\\s+(?:COLUMN\\s+)?(?:IF\\s+EXISTS\\s+)?\"?(\\w+)\"?")
+	alterRenameRe  = regexp.MustCompile("(?im)ALTER\\s+TABLE\\s+(?:IF\\s+EXISTS\\s+)?(?:`\\s*\\+\\s*(\\w+)\\s*\\+\\s*`|([\\w.\"]+))\\s+RENAME\\s+(?:COLUMN\\s+)?\"?(\\w+)\"?\\s+TO\\s+\"?(\\w+)\"?")
 	varRe          = regexp.MustCompile(`(\w+)\s*:=\s*\(?models\.(\w+)\{\}\)?\.TableName`)
 	colRe          = regexp.MustCompile(`^\s*"?(\w+)"?\s+([A-Za-z_]+(?:\s*\([^)]*\))?(?:\s+(?:WITH|WITHOUT)\s+TIME\s+ZONE)?)`)
 	fkRe           = regexp.MustCompile("(?i)FOREIGN\\s+KEY\\s*\\(\\s*\"?(\\w+)\"?\\s*\\)\\s*REFERENCES\\s+(?:`\\s*\\+\\s*(\\w+)\\s*\\+\\s*`|([\\w.\"]+))\\s*\\(\\s*\"?(\\w+)\"?\\s*\\)")
 	inlineRefRe    = regexp.MustCompile("(?i)REFERENCES\\s+(?:`\\s*\\+\\s*(\\w+)\\s*\\+\\s*`|([\\w.\"]+))\\s*\\(\\s*\"?(\\w+)\"?\\s*\\)")
-	schemaCreateRe = regexp.MustCompile(`(?s)Schema\(\)\.(?:Connection\([^)]*\)\.)?Create\(\s*(?:"([^"]+)"|(\w+))\s*,\s*func\s*\(\s*(\w+)\s+[^)]+\)\s*\{`)
+	schemaCreateRe = regexp.MustCompile(`(?s)Schema\(\)\.(?:Connection\([^)]*\)\.)?(Create|Table)\(\s*(?:"([^"]+)"|(\w+))\s*,\s*func\s*\(\s*(\w+)\s+[^)]+\)\s*\{`)
 	bpColRe        = regexp.MustCompile(`\b(?:table|blueprint)\.(ID|BigIncrements|Increments|Uuid|Ulid|String|Char|Text|MediumText|LongText|Integer|TinyInteger|SmallInteger|MediumInteger|BigInteger|UnsignedInteger|UnsignedBigInteger|Boolean|Decimal|Float|Double|Date|DateTime|DateTimeTz|Time|TimeTz|Timestamp|TimestampTz|Timestamps|TimestampsTz|SoftDeletes|SoftDeletesTz|Json|Jsonb|Binary|Enum|Morphs|NullableMorphs|UuidMorphs|ForeignId|ForeignUuid|ForeignUlid)\s*\(\s*(?:"([^"]+)")?`)
+	bpDropColRe    = regexp.MustCompile(`\b(?:table|blueprint)\.DropColumn\(\s*([^)]+)\)`)
+	bpRenameColRe  = regexp.MustCompile(`\b(?:table|blueprint)\.RenameColumn\(\s*"([^"]+)"\s*,\s*"([^"]+)"\s*\)`)
 	bpFkRe         = regexp.MustCompile(`\b(?:table|blueprint)\.Foreign\(\s*"([^"]+)"\s*\)\.References\(\s*"([^"]+)"\s*\)\.On\(\s*"([^"]+)"\s*\)`)
 	bpIdxRe        = regexp.MustCompile(`\b(?:table|blueprint)\.(Index|Unique|Primary)\(\s*([^)]+)\)`)
 	createIdxRe    = regexp.MustCompile("(?is)CREATE\\s+(UNIQUE\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?[\\w.\"]+\\s+ON\\s+(?:`\\s*\\+\\s*(\\w+)\\s*\\+\\s*`|([\\w.\"]+))\\s*\\(([^)]+)\\)")
@@ -25,6 +31,7 @@ var (
 
 func indexMigrations(c *Catalog, root string) {
 	dbDir := filepath.Join(root, "database")
+	var migPaths []string
 	_ = filepath.WalkDir(dbDir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(p, ".go") || strings.HasSuffix(p, "_test.go") {
 			return nil
@@ -34,9 +41,16 @@ func indexMigrations(c *Catalog, root string) {
 		if !strings.HasPrefix(relSlash, "migrations") {
 			return nil
 		}
+		migPaths = append(migPaths, p)
+		return nil
+	})
+	sort.Strings(migPaths)
+	for _, p := range migPaths {
+		rel, _ := filepath.Rel(dbDir, p)
+		relSlash := filepath.ToSlash(rel)
 		data, err := os.ReadFile(p)
 		if err != nil {
-			return nil
+			continue
 		}
 		folder := strings.Split(relSlash, "/")[0]
 		tname := parseMigration(c, p, string(data))
@@ -46,8 +60,7 @@ func indexMigrations(c *Catalog, root string) {
 			Table:  tname,
 			Loc:    Location{File: p, Line: 0, Col: 0},
 		})
-		return nil
-	})
+	}
 }
 
 func parseMigration(c *Catalog, path, src string) string {
@@ -146,20 +159,70 @@ func parseMigration(c *Catalog, path, src string) string {
 		}
 	}
 
-	// 2. facades.Schema().Create(...) Blueprints
-	for _, m := range schemaCreateRe.FindAllStringSubmatchIndex(src, -1) {
+	// 1b. Raw SQL ALTER TABLE ADD / DROP / RENAME COLUMN
+	upOnly := src
+	if downIdx := strings.Index(src, "Down() error"); downIdx > 0 {
+		upOnly = src[:downIdx]
+	}
+	for _, m := range alterAddRe.FindAllStringSubmatchIndex(upOnly, -1) {
 		var tname string
 		if m[2] >= 0 {
-			tname = src[m[2]:m[3]]
+			tname = vars[upOnly[m[2]:m[3]]]
 		} else if m[4] >= 0 {
-			v := src[m[4]:m[5]]
+			tname = upOnly[m[4]:m[5]]
+		}
+		if tname == "" {
+			continue
+		}
+		colName := upOnly[m[6]:m[7]]
+		rawDef := strings.TrimSpace(upOnly[m[8]:m[9]])
+		typ := strings.Fields(rawDef)[0]
+		t := c.ensure(tname)
+		if firstTable == "" {
+			firstTable = t.Name
+		}
+		upDef := strings.ToUpper(rawDef)
+		t.add(&Column{
+			Name:     colName,
+			SQLType:  strings.ToUpper(typ),
+			Nullable: !strings.Contains(upDef, "NOT NULL"),
+			MigLoc:   offsetLoc(path, src, m[6]),
+		})
+	}
+	for _, m := range alterDropRe.FindAllStringSubmatch(upOnly, -1) {
+		tname := m[2]
+		if m[1] != "" {
+			tname = vars[m[1]]
+		}
+		if tname != "" {
+			c.ensure(tname).removeColumn(m[3])
+		}
+	}
+	for _, m := range alterRenameRe.FindAllStringSubmatch(upOnly, -1) {
+		tname := m[2]
+		if m[1] != "" {
+			tname = vars[m[1]]
+		}
+		if tname != "" {
+			c.ensure(tname).renameColumn(m[3], m[4])
+		}
+	}
+
+	// 2. facades.Schema().Create(...) and facades.Schema().Table(...) Blueprints
+	for _, m := range schemaCreateRe.FindAllStringSubmatchIndex(upOnly, -1) {
+		op := upOnly[m[2]:m[3]]
+		var tname string
+		if m[4] >= 0 {
+			tname = upOnly[m[4]:m[5]]
+		} else if m[6] >= 0 {
+			v := upOnly[m[6]:m[7]]
 			tname = vars[v]
 		}
 		if tname == "" {
 			continue
 		}
 		openBrace := m[1] - 1
-		endBrace := matchBrace(src, openBrace)
+		endBrace := matchBrace(upOnly, openBrace)
 		if endBrace < 0 {
 			continue
 		}
@@ -167,14 +230,24 @@ func parseMigration(c *Catalog, path, src string) string {
 		if firstTable == "" {
 			firstTable = t.Name
 		}
-		if !t.MigLoc.Valid() {
+		if op == "Create" || !t.MigLoc.Valid() {
 			t.MigLoc = offsetLoc(path, src, m[0])
 		}
 		bodyStart := openBrace + 1
 		off := bodyStart
-		for _, line := range strings.Split(src[bodyStart:endBrace], "\n") {
+		for _, line := range strings.Split(upOnly[bodyStart:endBrace], "\n") {
 			lineOff := off
 			off += len(line) + 1
+			if dm := bpDropColRe.FindStringSubmatch(line); dm != nil {
+				for _, q := range quotedStrRe.FindAllStringSubmatch(dm[1], -1) {
+					t.removeColumn(q[1])
+				}
+				continue
+			}
+			if rm := bpRenameColRe.FindStringSubmatch(line); rm != nil {
+				t.renameColumn(rm[1], rm[2])
+				continue
+			}
 			if fkm := bpFkRe.FindStringSubmatch(line); fkm != nil {
 				targetTbl := StripSchema(fkm[3])
 				if col := t.Column(fkm[1]); col != nil {

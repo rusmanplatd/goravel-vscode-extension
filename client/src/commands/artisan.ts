@@ -12,6 +12,16 @@ const ARTISAN_PRESETS: { label: string; description: string; cmd: string; prompt
   { label: "make:seeder", description: "Create a new seeder class", cmd: "make:seeder", prompt: "Seeder name (e.g. CitySeeder)" },
   { label: "make:middleware", description: "Create a new middleware class", cmd: "make:middleware", prompt: "Middleware name" },
   { label: "make:command", description: "Create a new Artisan command", cmd: "make:command", prompt: "Command name" },
+  { label: "make:event", description: "Create a new event class", cmd: "make:event", prompt: "Event name (e.g. UserRegistered)" },
+  { label: "make:listener", description: "Create a new event listener class", cmd: "make:listener", prompt: "Listener name (e.g. SendWelcomeEmail)" },
+  { label: "make:job", description: "Create a new queue job class", cmd: "make:job", prompt: "Job name (e.g. ProcessPodcast)" },
+  { label: "make:observer", description: "Create a new model observer class", cmd: "make:observer", prompt: "Observer name (e.g. UserObserver)" },
+  { label: "make:policy", description: "Create a new authorization policy class", cmd: "make:policy", prompt: "Policy name (e.g. PostPolicy)" },
+  { label: "make:provider", description: "Create a new service provider class", cmd: "make:provider", prompt: "Provider name (e.g. PaymentServiceProvider)" },
+  { label: "make:factory", description: "Create a new model factory", cmd: "make:factory", prompt: "Factory name (e.g. UserFactory)" },
+  { label: "make:test", description: "Create a new test class", cmd: "make:test", prompt: "Test name (e.g. UserTest)" },
+  { label: "make:filter", description: "Create a new filter class", cmd: "make:filter", prompt: "Filter name" },
+  { label: "package:install", description: "Install a Goravel package or driver", cmd: "package:install", prompt: "Package name or facade" },
   { label: "migrate", description: "Run the database migrations", cmd: "migrate" },
   { label: "migrate:rollback", description: "Rollback the last database migration", cmd: "migrate:rollback" },
   { label: "migrate:status", description: "Show the status of each migration", cmd: "migrate:status" },
@@ -27,10 +37,15 @@ function getTerminal(): vscode.Terminal {
   return vscode.window.createTerminal("Goravel Artisan");
 }
 
+function getArtisanPrefix(): string {
+  const cfg = vscode.workspace.getConfiguration("goravel").get<string>("artisan.command");
+  return cfg && cfg.trim() ? cfg.trim() : "go run . artisan";
+}
+
 export function runArtisanInTerminal(args: string) {
   const term = getTerminal();
   term.show(true);
-  term.sendText(`go run . artisan ${args}`);
+  term.sendText(`${getArtisanPrefix()} ${args}`);
 }
 
 async function promptAndRun(cmd: string, prompt: string) {
@@ -105,6 +120,30 @@ export function registerArtisanCommands(
     ),
     vscode.commands.registerCommand("goravel.artisan.makeSeeder", () =>
       promptAndRun("make:seeder", "Seeder name (e.g. CitySeeder)")
+    ),
+    vscode.commands.registerCommand("goravel.artisan.makeEvent", () =>
+      promptAndRun("make:event", "Event name (e.g. UserRegistered)")
+    ),
+    vscode.commands.registerCommand("goravel.artisan.makeListener", () =>
+      promptAndRun("make:listener", "Listener name (e.g. SendWelcomeEmail)")
+    ),
+    vscode.commands.registerCommand("goravel.artisan.makeJob", () =>
+      promptAndRun("make:job", "Job name (e.g. ProcessPodcast)")
+    ),
+    vscode.commands.registerCommand("goravel.artisan.makeObserver", () =>
+      promptAndRun("make:observer", "Observer name (e.g. UserObserver)")
+    ),
+    vscode.commands.registerCommand("goravel.artisan.makePolicy", () =>
+      promptAndRun("make:policy", "Policy name (e.g. PostPolicy)")
+    ),
+    vscode.commands.registerCommand("goravel.artisan.makeProvider", () =>
+      promptAndRun("make:provider", "Provider name (e.g. PaymentServiceProvider)")
+    ),
+    vscode.commands.registerCommand("goravel.artisan.makeFactory", () =>
+      promptAndRun("make:factory", "Factory name (e.g. UserFactory)")
+    ),
+    vscode.commands.registerCommand("goravel.artisan.makeTest", () =>
+      promptAndRun("make:test", "Test name (e.g. UserTest)")
     ),
     vscode.commands.registerCommand("goravel.artisan.migrate", () => runArtisanInTerminal("migrate")),
     vscode.commands.registerCommand("goravel.artisan.migrateRollback", () => runArtisanInTerminal("migrate:rollback")),
