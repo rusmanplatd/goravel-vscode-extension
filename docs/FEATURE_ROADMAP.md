@@ -19,7 +19,7 @@ This document tracks the analysis of existing capabilities and implemented enhan
 | **Bootstrap Wiring** | Read-only warnings for unregistered items | + One-click **Cross-File Quick Fix** & Sidebar button (`goravel.registerBootstrap`) to auto-register migrations (including `bootstrap/bootstrap_<module>/migrations.go`), seeders, rules, and commands |
 | **ORM Query Builder & Models** | `.Where`, `.Select`, `.Order`, `.Group`, `.Update("col", v)`, `.Pluck`, `.With("Rel")` | + `.Join` / `.LeftJoin` / `.InnerJoin` / `.RightJoin` (table, column & FK `ON` completion + alias resolution), map-based `.Where(map[string]any{...})` & `.Updates(map[string]any{...})`, `.Distinct`, `.WhereColumn`, `.Increment`, `.Decrement`, nested `.With("Rel", func(q orm.Query) ...)` target-table inference, and **Model Observer & Scope CodeLens** |
 | **Routes, gRPC & Controllers** | Route indexing, `ctx.Request().Route("param")`, controller CodeLens, `@Router` drift check | + `routes/*.go` **Inlay Hints** & **Hover** (`→ METHOD /full/path [Middlewares]`), **gRPC controllers & `.proto` service indexing** (`routes/grpc.go`, `app/grpc/controllers`), `ctx.Request().Input*("...")` & `Query*("...")` completion/hover/definition, and full **Swagger / OpenAPI annotation scaffolding** & `@Router` sync Quick Fixes |
-| **Views & Templates** | `View().Make("...")` template path completion & unused key hint | + Context variable indexing from `View().Make("...", map[string]any{...})` with **completion, hover, and go-to-definition inside `.tmpl` / `.html` / `.gohtml` files** in `resources/views/` |
+| **Views & Templates** | `View().Make("...")` template path completion & unused key hint | + Full `facades.View()` (`Exists`, `LoadViewsFrom`, `Share`, `Shared`), `View().First(...)`, & `path.View(...)` support; package view override resolution; **`.tmpl` / `.gohtml` syntax highlighting grammar**; `.tmpl` LSP (`{{ template }}` navigation, context/shared/inherited vars, nested model struct fields, local `$vars`, diagnostics, Quick Fix scaffolding, cross-file rename/refs, and template CodeLens) |
 | **Config & `.env`** | `facades.Config().Get*` completion, hover, inlay hints, go-to-definition | + Missing `.env` key diagnostics on `config.Env("KEY")` and cross-file Quick Fix to append missing keys to `.env.example` / `.env` |
 | **Localization (`Lang`)** | *Not supported* | + Full `lang/**/*.json` indexing (flat & nested keys), `facades.Lang(ctx).Get("...")` completion, multi-locale Markdown hover, inline preview inlay hints, go-to-definition, references, rename, missing-key diagnostics, and Quick Fix to add keys to `lang/en.json` |
 | **Authorization (`Gate`)** | *Not supported* | + Indexes `facades.Gate().Define("ability", ...)` across `app/` & `bootstrap/`; provides completion, hover, definition, references, rename, and unknown-ability diagnostics on `Allows`, `Denies`, `Inspect`, `Check`, `Any`, `None` |
@@ -137,6 +137,26 @@ This document tracks the analysis of existing capabilities and implemented enhan
 
 ---
 
+### P5 — `facades.View` Intelligence & `.tmpl` Syntax Highlighting + Full LSP
+
+- [x] **P5.1: `.tmpl` / `.gohtml` Syntax Highlighting, Language Configuration & Snippets**
+  - Registered `goravel-tmpl` language (`language-configuration.tmpl.json`), `text.html.goravel-tmpl` TextMate grammar (`syntaxes/goravel-tmpl.tmLanguage.json`), and Go template snippets (`snippets/goravel-tmpl.code-snippets`).
+  - *Files:* `package.json`, `language-configuration.tmpl.json`, `syntaxes/goravel-tmpl.tmLanguage.json`, `snippets/goravel-tmpl.code-snippets`, `client/src/extension.ts`.
+- [x] **P5.2: Package Views (`LoadViewsFrom`), Shared View Data (`Share`/`Shared`), `First`, `Exists`, & `path.View` Indexing**
+  - Indexed `facades.View().LoadViewsFrom(...)` directories (`packages/**/views`), tracking app view vs. package view override precedence (`ViewItem`).
+  - Indexed `facades.View().Share("key", val)` (`SharedViewVars`), `View().First([]string{...}, data)`, `View().Exists("...")`, and `path.View("...")`.
+  - Inferred Go struct/model types (`GoType`) for template variables and propagated parent `ViewVars` to partials included via `{{ template "..." . }}`.
+  - *Files:* `server/internal/indexer/schema.go`, `server/internal/indexer/extras.go`.
+- [x] **P5.3: Enhanced `facades.View` & `ResponseView` Intelligence in Go Files**
+  - Provided completion, rich hover (source, override status, `{{ define }}` name, included partials, variables), go-to-definition (active + fallback locations), transitive unused-key diagnostics, and Quick Fix to scaffold missing `.tmpl` files.
+  - *Files:* `server/internal/framework/views.go`, `server/internal/lsp/server.go`.
+- [x] **P5.4: Full `.tmpl` / `.gohtml` LSP (Completion, Hover, Definition, References, Rename, Diagnostics, Quick Fixes, CodeLens)**
+  - Provided `.tmpl` completion for `{{ template "..." }}` / `{{ block "..." }}`, context/shared/inherited `.vars`, nested `.model.Field` struct fields, local `$vars`, and Go template keywords/built-ins.
+  - Provided `.tmpl` hover, go-to-definition, cross-file Find References & Rename (`F2`), template diagnostics (missing partial, mismatched `define`, unclosed/unbalanced blocks), Quick Fixes, and top-of-file CodeLens (routes/controllers rendering the view, parent includes, and package overrides).
+  - *Files:* `server/internal/framework/views.go`, `server/internal/lsp/server.go`, `server/internal/lsp/references.go`, `server/internal/lsp/rename.go`, `server/internal/lsp/features_test.go`.
+
+---
+
 ## 3. Verification & Test Suite
 
 - **Go LSP Unit Tests:** `server/internal/lsp/features_test.go` (`npm run test:server`)
@@ -144,4 +164,5 @@ This document tracks the analysis of existing capabilities and implemented enhan
   - `TestORMJoinMapWhereWithCallbackAndLangGate` — Verifies `.LeftJoin`, map-based `.Where(map[string]any{...})`, nested `.With("Posts", func(q orm.Query) ...)` callback table inference, missing translation key diagnostics & inlay hints, and unknown Gate ability diagnostics.
   - `TestSanitizeSQLPlaceholdersAndERDiagramAndRename` — Verifies `SanitizeSQLPlaceholders` (`$1`, `?`, `@p1`), `goravel/erDiagram` Mermaid output, and workspace-wide `textDocument/rename`.
   - `TestP4LiveMigrationsObserversTemplatesGrpcAndSwagger` — Verifies live migration `applied` (with batch number) vs `pending` status (`P4.1`), Observer & Scope indexing + Model CodeLens (`P4.2`), `.tmpl` template variable completion/hover/definition (`P4.3`), gRPC controller & `.proto` route indexing (`P4.4`), and full Swagger/OpenAPI annotation Code Action generation (`P4.5`).
+  - `TestP5ViewFacadeAndTemplateLSP` — Verifies `facades.View().LoadViewsFrom(...)` & app view override precedence, `Exists`/`First`/`Share`/`Shared` intelligence, sub-template context propagation, `.tmpl` completion (partials, nested model fields, local `$vars`, shared vars, keywords), `.tmpl` diagnostics/Quick Fixes/CodeLens, and cross-file Rename between Go controllers and `.tmpl` files (`P5.1`–`P5.4`).
 - **Client Typecheck & Bundle:** `npm run typecheck && npm run build`

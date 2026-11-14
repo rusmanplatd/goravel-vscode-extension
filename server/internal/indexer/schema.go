@@ -325,11 +325,45 @@ type ScopeItem struct {
 	Loc   Location `json:"loc"`
 }
 
-// ViewVar describes a template variable passed via ctx.Response().View().Make("view", map[string]any{...}).
+// TemplateInclude describes a {{ template "..." }} or {{ block "..." }} inclusion inside a template.
+type TemplateInclude struct {
+	Target  string   `json:"target"`
+	PassDot bool     `json:"passDot"`
+	Loc     Location `json:"loc"`
+}
+
+// ViewCaller describes a Go call site (Make, First, Exists, path.View) referencing a view.
+type ViewCaller struct {
+	ViewName   string   `json:"viewName"`
+	Method     string   `json:"method"` // Make | First | Exists | PathView
+	Controller string   `json:"controller,omitempty"`
+	Route      string   `json:"route,omitempty"`
+	Loc        Location `json:"loc"`
+}
+
+// ViewItem describes an indexed template file from resources/views/ or a LoadViewsFrom package directory.
+type ViewItem struct {
+	Name        string            `json:"name"`                  // canonical relative view key (e.g. "admin/index.tmpl")
+	RelDisplay  string            `json:"relDisplay"`            // workspace-relative path (e.g. "resources/views/shared.tmpl")
+	Source      string            `json:"source"`                // "app" or "package"
+	Loc         Location          `json:"loc"`                   // active winning template file
+	PackageLocs []Location        `json:"packageLocs,omitempty"` // fallback/overridden package locations
+	DefineName  string            `json:"defineName,omitempty"`  // name in {{ define "..." }}
+	DefineLoc   Location          `json:"defineLoc,omitempty"`
+	Includes    []TemplateInclude `json:"includes,omitempty"`
+	UsedVars    []string          `json:"usedVars,omitempty"`
+	PassesDot   bool              `json:"passesDot,omitempty"`
+	Callers     []ViewCaller      `json:"callers,omitempty"`
+}
+
+// ViewVar describes a template variable passed via ctx.Response().View().Make("view", map[string]any{...}) or facades.View().Share("key", val).
 type ViewVar struct {
 	Key        string   `json:"key"`
 	ValueExpr  string   `json:"valueExpr"`
+	GoType     string   `json:"goType,omitempty"`
 	Controller string   `json:"controller,omitempty"`
+	Shared     bool     `json:"shared,omitempty"`
+	Inherited  string   `json:"inherited,omitempty"`
 	Loc        Location `json:"loc"`
 }
 
@@ -375,7 +409,10 @@ type Catalog struct {
 	Commands           []*CommandItem                         // custom Artisan commands
 	Controllers        map[string]map[string]Location         // Controller -> Method -> Location
 	Views              map[string]Location                    // relative view path (e.g. "auth/signin.tmpl") -> Location
+	ViewItems          map[string]*ViewItem                   // relative view path -> rich ViewItem metadata
 	ViewVars           map[string][]ViewVar                   // view name -> passed template variables
+	SharedViewVars     map[string][]ViewVar                   // key -> global shared variables from View().Share(key, val)
+	PackageViewDirs    []string                               // absolute paths registered via LoadViewsFrom
 	Middleware         map[string]Location                    // middleware name -> Location
 	Seeders            []*SeederItem                          // database seeders
 	Schedules          []*ScheduleItem                        // scheduled tasks
@@ -402,7 +439,9 @@ func NewCatalog() *Catalog {
 		Rules:              map[string]*RuleItem{},
 		Controllers:        map[string]map[string]Location{},
 		Views:              map[string]Location{},
+		ViewItems:          map[string]*ViewItem{},
 		ViewVars:           map[string][]ViewVar{},
+		SharedViewVars:     map[string][]ViewVar{},
 		Middleware:         map[string]Location{},
 		Translations:       map[string]map[string]TranslationEntry{},
 		Gates:              map[string]*GateItem{},
@@ -531,6 +570,51 @@ func (c *Catalog) GateAbilities() []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// LookupView resolves a ViewItem by view name (with or without extension) or by {{ define }} name.
+func (c *Catalog) LookupView(name string) *ViewItem {
+	if c == nil || name == "" {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	clean := strings.TrimPrefix(strings.TrimSpace(strings.ReplaceAll(name, "\\", "/")), "/")
+	if vi := c.ViewItems[clean]; vi != nil {
+		return vi
+	}
+	for _, ext := range []string{".tmpl", ".html", ".gohtml"} {
+		if vi := c.ViewItems[clean+ext]; vi != nil {
+			return vi
+		}
+	}
+	for _, vi := range c.ViewItems {
+		if vi.DefineName == clean || strings.TrimSuffix(vi.Name, ".tmpl") == clean || strings.TrimSuffix(vi.Name, ".html") == clean || strings.TrimSuffix(vi.Name, ".gohtml") == clean {
+			return vi
+		}
+	}
+	return nil
+}
+
+// ViewForPath resolves a ViewItem by its file path on disk (matching either primary Loc or PackageLocs).
+func (c *Catalog) ViewForPath(filePath string) *ViewItem {
+	if c == nil || filePath == "" {
+		return nil
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	norm := strings.ReplaceAll(filePath, "\\", "/")
+	for _, vi := range c.ViewItems {
+		if strings.ReplaceAll(vi.Loc.File, "\\", "/") == norm {
+			return vi
+		}
+		for _, pl := range vi.PackageLocs {
+			if strings.ReplaceAll(pl.File, "\\", "/") == norm {
+				return vi
+			}
+		}
+	}
+	return nil
 }
 
 // Build indexes the project at root.

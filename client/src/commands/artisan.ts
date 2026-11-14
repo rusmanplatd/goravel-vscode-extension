@@ -20,6 +20,7 @@ const ARTISAN_PRESETS: { label: string; description: string; cmd: string; prompt
   { label: "make:provider", description: "Create a new service provider class", cmd: "make:provider", prompt: "Provider name (e.g. PaymentServiceProvider)" },
   { label: "make:factory", description: "Create a new model factory", cmd: "make:factory", prompt: "Factory name (e.g. UserFactory)" },
   { label: "make:test", description: "Create a new test class", cmd: "make:test", prompt: "Test name (e.g. UserTest)" },
+  { label: "make:view", description: "Create a new view template file", cmd: "make:view", prompt: "View name (e.g. admin/dashboard.tmpl)" },
   { label: "make:filter", description: "Create a new filter class", cmd: "make:filter", prompt: "Filter name" },
   { label: "package:install", description: "Install a Goravel package or driver", cmd: "package:install", prompt: "Package name or facade" },
   { label: "migrate", description: "Run the database migrations", cmd: "migrate" },
@@ -144,6 +145,9 @@ export function registerArtisanCommands(
     ),
     vscode.commands.registerCommand("goravel.artisan.makeTest", () =>
       promptAndRun("make:test", "Test name (e.g. UserTest)")
+    ),
+    vscode.commands.registerCommand("goravel.artisan.makeView", () =>
+      promptAndRun("make:view", "View name (e.g. admin/dashboard.tmpl)")
     ),
     vscode.commands.registerCommand("goravel.artisan.migrate", () => runArtisanInTerminal("migrate")),
     vscode.commands.registerCommand("goravel.artisan.migrateRollback", () => runArtisanInTerminal("migrate:rollback")),

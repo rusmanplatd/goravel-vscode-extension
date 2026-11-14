@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/rusmanplatd/goravel-lsp/internal/framework"
 	"github.com/rusmanplatd/goravel-lsp/internal/orm"
 	"github.com/rusmanplatd/goravel-lsp/internal/rawsql"
 )
@@ -45,29 +46,32 @@ func (s *Server) rename(raw json.RawMessage) any {
 	var targetGateAbility string
 	var targetLangKey string
 	var targetTable, targetColumn string
+	targetViewName, targetViewVarKey, isSharedViewVar := framework.TemplateTargetAtOffset(path, text, s.cat, off)
 
 	// 1. Check ORM / Config / Validation / Lang / Gate spans
-	fa := orm.AnalyzeFile(path, []byte(text), s.cat)
-	if sp := fa.SpanAt(off); sp != nil {
-		relOff := off - sp.Start
-		switch sp.Kind {
-		case orm.SpanConfigKey:
-			targetConfigKey = sp.Text
-		case orm.SpanLangKey:
-			targetLangKey = sp.Text
-		case orm.SpanGateAbility:
-			targetGateAbility = sp.Text
-		case orm.SpanRuleValue:
-			rname, _, _ := ruleNameAt(sp.Text, relOff)
-			if rname != "" {
-				targetRuleName = rname
-			}
-		case orm.SpanORMWhere, orm.SpanORMColumn, orm.SpanORMOrder, orm.SpanPatchKey:
-			if sp.Table != nil {
-				w := identWordAt(sp.Text, relOff)
-				if col := sp.Table.Column(w); col != nil {
-					targetTable = sp.Table.Name
-					targetColumn = col.Name
+	if strings.HasSuffix(path, ".go") {
+		fa := orm.AnalyzeFile(path, []byte(text), s.cat)
+		if sp := fa.SpanAt(off); sp != nil {
+			relOff := off - sp.Start
+			switch sp.Kind {
+			case orm.SpanConfigKey:
+				targetConfigKey = sp.Text
+			case orm.SpanLangKey:
+				targetLangKey = sp.Text
+			case orm.SpanGateAbility:
+				targetGateAbility = sp.Text
+			case orm.SpanRuleValue:
+				rname, _, _ := ruleNameAt(sp.Text, relOff)
+				if rname != "" {
+					targetRuleName = rname
+				}
+			case orm.SpanORMWhere, orm.SpanORMColumn, orm.SpanORMOrder, orm.SpanPatchKey:
+				if sp.Table != nil {
+					w := identWordAt(sp.Text, relOff)
+					if col := sp.Table.Column(w); col != nil {
+						targetTable = sp.Table.Name
+						targetColumn = col.Name
+					}
 				}
 			}
 		}
@@ -122,12 +126,21 @@ func (s *Server) rename(raw json.RawMessage) any {
 		}
 	}
 
-	if targetConfigKey == "" && targetRuleName == "" && targetGateAbility == "" && targetLangKey == "" && targetColumn == "" {
+	if targetConfigKey == "" && targetRuleName == "" && targetGateAbility == "" && targetLangKey == "" && targetColumn == "" && targetViewName == "" && targetViewVarKey == "" {
 		return nil
 	}
 
 	scanFile := func(fpath, content string) {
 		furi := pathToURI(fpath)
+		if targetViewName != "" || targetViewVarKey != "" {
+			cleanNew := strings.TrimPrefix(newName, ".")
+			for _, sp := range framework.FindViewAndTemplateSpans(fpath, content, s.cat, targetViewName, targetViewVarKey, isSharedViewVar) {
+				addEdit(furi, content, sp[0], sp[1], cleanNew)
+			}
+		}
+		if !strings.HasSuffix(fpath, ".go") {
+			return
+		}
 		ffa := orm.AnalyzeFile(fpath, []byte(content), s.cat)
 		for _, sp := range ffa.Spans {
 			if targetConfigKey != "" && sp.Kind == orm.SpanConfigKey && sp.Text == targetConfigKey {
@@ -182,8 +195,8 @@ func (s *Server) rename(raw json.RawMessage) any {
 
 	visited := map[string]bool{}
 	for u, doc := range s.docs {
-		if strings.HasSuffix(u, ".go") {
-			fp := filepath.Clean(uriToPath(u))
+		fp := filepath.Clean(uriToPath(u))
+		if strings.HasSuffix(fp, ".go") || framework.IsTemplateFile(fp) {
 			visited[fp] = true
 			scanFile(fp, doc)
 		}
@@ -196,7 +209,11 @@ func (s *Server) rename(raw json.RawMessage) any {
 			if d.IsDir() && (d.Name() == "vendor" || d.Name() == "node_modules" || d.Name() == ".git") {
 				return filepath.SkipDir
 			}
-			if d.IsDir() || !strings.HasSuffix(fp, ".go") || strings.HasSuffix(fp, "_test.go") {
+			if d.IsDir() {
+				return nil
+			}
+			isGo := strings.HasSuffix(fp, ".go") && (!strings.HasSuffix(fp, "_test.go") || targetViewName != "" || targetViewVarKey != "")
+			if !isGo && !framework.IsTemplateFile(fp) {
 				return nil
 			}
 			cfp := filepath.Clean(fp)

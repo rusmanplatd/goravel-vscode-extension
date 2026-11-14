@@ -1,0 +1,73 @@
+{
+  "Goravel Template Define": {
+    "prefix": "gdefine",
+    "body": [
+      "{{ define \"${1:path/view.tmpl}\" }}",
+      "\t$0",
+      "{{ end }}"
+    ],
+    "description": "Define a named Goravel view template block"
+  },
+  "Goravel Template Include": {
+    "prefix": "gtemplate",
+    "body": [
+      "{{ template \"${1:layouts/header.tmpl}\" ${2:.} }}"
+    ],
+    "description": "Include a sub-template or layout partial"
+  },
+  "Goravel Template Block": {
+    "prefix": "gblock",
+    "body": [
+      "{{ block \"${1:content}\" ${2:.} }}",
+      "\t$0",
+      "{{ end }}"
+    ],
+    "description": "Define a replaceable template block"
+  },
+  "Goravel Template If": {
+    "prefix": "gif",
+    "body": [
+      "{{ if .${1:condition} }}",
+      "\t$0",
+      "{{ end }}"
+    ],
+    "description": "Go template conditional block"
+  },
+  "Goravel Template If-Else": {
+    "prefix": "gifelse",
+    "body": [
+      "{{ if .${1:condition} }}",
+      "\t$2",
+      "{{ else }}",
+      "\t$0",
+      "{{ end }}"
+    ],
+    "description": "Go template if-else conditional block"
+  },
+  "Goravel Template Range": {
+    "prefix": "grange",
+    "body": [
+      "{{ range $${1:index}, $${2:item} := .${3:items} }}",
+      "\t$0",
+      "{{ end }}"
+    ],
+    "description": "Iterate over a slice or map in a Goravel template"
+  },
+  "Goravel Template With": {
+    "prefix": "gwith",
+    "body": [
+      "{{ with .${1:value} }}",
+      "\t$0",
+      "{{ end }}"
+    ],
+    "description": "Bind context pipeline to a nested field if non-empty"
+  },
+  "Goravel CSRF Token": {
+    "prefix": "gcsrf",
+    "body": [
+      "{{ .csrf_token }}"
+    ],
+    "description": "Output Goravel CSRF token"
+  }
+}
+

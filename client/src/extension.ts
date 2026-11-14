@@ -80,14 +80,16 @@ async function start(ctx: vscode.ExtensionContext) {
   const clientOptions: LanguageClientOptions = {
     documentSelector: [
       { scheme: "file", language: "go" },
-      { scheme: "file", pattern: "**/resources/views/**/*.{tmpl,html,gohtml}" },
+      { scheme: "file", language: "goravel-tmpl" },
+      { scheme: "file", pattern: "**/*.{tmpl,gohtml}" },
+      { scheme: "file", pattern: "**/resources/views/**/*.html" },
     ],
     initializationOptions: {
       liveIntrospection: cfg.get<boolean>("sql.liveIntrospection", false),
     },
     synchronize: {
       fileEvents: vscode.workspace.createFileSystemWatcher(
-        "**/{app/models,app/rules,app/console,app/events,app/listeners,app/jobs,app/observers,app/providers,app/grpc,app/http/controllers,app/http/requests,app/http/middleware,bootstrap,config,routes,database/migrations*,database/seeders,resources/views,lang,proto}/**/*"
+        "**/{app/models,app/rules,app/console,app/events,app/listeners,app/jobs,app/observers,app/providers,app/grpc,app/http/controllers,app/http/requests,app/http/middleware,bootstrap,config,routes,database/migrations*,database/seeders,resources/views,packages,lang,proto}/**/*"
       ),
     },
   };
@@ -179,6 +181,15 @@ export async function activate(ctx: vscode.ExtensionContext) {
     }),
     vscode.commands.registerCommand("goravel.openLocation", async (file: string, line: number, col: number) => {
       await openFileAt(file, line, col);
+    }),
+    vscode.commands.registerCommand("goravel.createFileIfMissing", async (filePath: string, content: string) => {
+      if (!filePath) return;
+      if (!fs.existsSync(filePath)) {
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        fs.writeFileSync(filePath, content || "", "utf8");
+      }
+      await openFileAt(filePath, 0, 0);
+      await refreshOverview();
     }),
     vscode.commands.registerCommand("goravel.jumpToRoute", async (uri: string, line: number, col: number) => {
       await openFileAt(uri, line, col);

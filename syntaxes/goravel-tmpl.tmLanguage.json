@@ -1,0 +1,113 @@
+{
+  "name": "Go HTML Template (Goravel)",
+  "scopeName": "text.html.goravel-tmpl",
+  "fileTypes": [
+    "tmpl",
+    "gohtml"
+  ],
+  "injections": {
+    "L:(text.html.goravel-tmpl - comment.block.goravel-tmpl)": {
+      "patterns": [
+        { "include": "#tmpl-comment" },
+        { "include": "#tmpl-action" }
+      ]
+    }
+  },
+  "patterns": [
+    { "include": "#tmpl-comment" },
+    { "include": "#tmpl-action" },
+    { "include": "text.html.basic" }
+  ],
+  "repository": {
+    "tmpl-comment": {
+      "begin": "\\{\\{-?\\s*/\\*",
+      "end": "\\*/\\s*-?\\}\\}",
+      "beginCaptures": {
+        "0": { "name": "punctuation.definition.comment.begin.goravel-tmpl" }
+      },
+      "endCaptures": {
+        "0": { "name": "punctuation.definition.comment.end.goravel-tmpl" }
+      },
+      "name": "comment.block.goravel-tmpl"
+    },
+    "tmpl-action": {
+      "begin": "(\\{\\{-?)",
+      "end": "(-?\\}\\})",
+      "beginCaptures": {
+        "1": { "name": "punctuation.section.embedded.begin.goravel-tmpl keyword.operator.template.delimiters.goravel-tmpl" }
+      },
+      "endCaptures": {
+        "1": { "name": "punctuation.section.embedded.end.goravel-tmpl keyword.operator.template.delimiters.goravel-tmpl" }
+      },
+      "name": "meta.embedded.block.goravel-tmpl",
+      "patterns": [
+        { "include": "#tmpl-tokens" }
+      ]
+    },
+    "tmpl-tokens": {
+      "patterns": [
+        {
+          "match": "\"(?:\\\\.|[^\"\\\\])*\"",
+          "name": "string.quoted.double.goravel-tmpl"
+        },
+        {
+          "begin": "`",
+          "end": "`",
+          "name": "string.quoted.raw.goravel-tmpl"
+        },
+        {
+          "match": "'(?:\\\\.|[^'\\\\])+'",
+          "name": "constant.character.goravel-tmpl"
+        },
+        {
+          "match": "\\b(define|template|block|if|else|range|with|end|break|continue)\\b",
+          "name": "keyword.control.goravel-tmpl"
+        },
+        {
+          "match": "\\b(true|false|nil)\\b",
+          "name": "constant.language.goravel-tmpl"
+        },
+        {
+          "match": "\\b(and|or|not|len|index|slice|printf|print|println|urlquery|js|html|call|eq|ne|lt|le|gt|ge)\\b",
+          "name": "support.function.builtin.goravel-tmpl"
+        },
+        {
+          "match": "(\\$[A-Za-z_][A-Za-z0-9_]*)?((?:\\.[A-Za-z_][A-Za-z0-9_]*)+)",
+          "captures": {
+            "1": { "name": "variable.other.readwrite.goravel-tmpl" },
+            "2": { "name": "variable.other.property.goravel-tmpl" }
+          }
+        },
+        {
+          "match": "\\$[A-Za-z_][A-Za-z0-9_]*",
+          "name": "variable.other.readwrite.goravel-tmpl"
+        },
+        {
+          "match": "(?<=\\s|\\(|\\||\\{)(\\.|\\$)(?=\\s|\\)|\\||\\})",
+          "name": "variable.language.context.goravel-tmpl"
+        },
+        {
+          "match": ":=",
+          "name": "keyword.operator.assignment.goravel-tmpl"
+        },
+        {
+          "match": "\\|",
+          "name": "keyword.operator.pipe.goravel-tmpl"
+        },
+        {
+          "match": "\\b(?:0[xX][0-9a-fA-F]+|\\d+(?:\\.\\d+)?)\\b",
+          "name": "constant.numeric.goravel-tmpl"
+        },
+        {
+          "match": "[()]",
+          "name": "punctuation.parenthesis.goravel-tmpl"
+        },
+        {
+          "match": "\\b[A-Za-z_][A-Za-z0-9_]*\\b",
+          "name": "entity.name.function.goravel-tmpl"
+        }
+      ]
+    }
+  }
+}
+

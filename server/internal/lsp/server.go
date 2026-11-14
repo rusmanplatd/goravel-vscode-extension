@@ -153,7 +153,7 @@ func (s *Server) dispatch(m *message) {
 		s.reply(m.ID, map[string]any{
 			"capabilities": map[string]any{
 				"textDocumentSync":   1,
-				"completionProvider": map[string]any{"triggerCharacters": []string{".", " ", "\"", "|", ":", ","}},
+				"completionProvider": map[string]any{"triggerCharacters": []string{".", "$", " ", "\"", "|", ":", ","}},
 				"hoverProvider":      true,
 				"definitionProvider": true,
 				"referencesProvider": true,
@@ -297,7 +297,10 @@ func shouldReindex(path string) bool {
 		strings.Contains(path, "/app/providers/") ||
 		strings.Contains(path, "/bootstrap/") ||
 		strings.Contains(path, "/resources/views/") ||
+		strings.Contains(path, "/packages/") ||
+		strings.Contains(path, "/tests/") ||
 		strings.Contains(path, "/lang/") ||
+		framework.IsTemplateFile(path) ||
 		strings.HasSuffix(path, ".proto") ||
 		strings.HasSuffix(path, "/.env") ||
 		strings.HasSuffix(path, "/.env.example")
@@ -362,7 +365,11 @@ func (s *Server) completion(raw json.RawMessage) any {
 		if tItems := framework.TemplateCompletions(path, text, s.cat, off); len(tItems) > 0 {
 			var lspItems []map[string]any
 			for _, it := range tItems {
-				lspItems = append(lspItems, map[string]any{"label": it.Label, "detail": it.Detail, "kind": it.Kind})
+				m := map[string]any{"label": it.Label, "detail": it.Detail, "kind": it.Kind}
+				if it.Doc != "" {
+					m["documentation"] = map[string]any{"kind": "markdown", "value": it.Doc}
+				}
+				lspItems = append(lspItems, m)
 			}
 			return map[string]any{"isIncomplete": false, "items": lspItems}
 		}
@@ -378,7 +385,11 @@ func (s *Server) completion(raw json.RawMessage) any {
 	if fItems := append(framework.RequestCompletions(path, text, s.cat, off), framework.ViewCompletions(path, text, s.cat, off)...); len(fItems) > 0 {
 		var lspItems []map[string]any
 		for _, it := range fItems {
-			lspItems = append(lspItems, map[string]any{"label": it.Label, "detail": it.Detail, "kind": it.Kind})
+			m := map[string]any{"label": it.Label, "detail": it.Detail, "kind": it.Kind}
+			if it.Doc != "" {
+				m["documentation"] = map[string]any{"kind": "markdown", "value": it.Doc}
+			}
+			lspItems = append(lspItems, m)
 		}
 		return map[string]any{"isIncomplete": false, "items": lspItems}
 	}
@@ -698,8 +709,8 @@ func (s *Server) definition(raw json.RawMessage) any {
 	for _, l := range fa.Definition(off, s.cat) {
 		add(l, 0)
 	}
-	if d := framework.ViewDefinition(path, text, s.cat, off); d != nil {
-		add(d.Loc, 0)
+	for _, l := range framework.ViewLocations(path, text, s.cat, off) {
+		add(l, 0)
 	}
 	if d := framework.RouteMiddlewareDefinition(path, text, s.cat, off); d != nil {
 		add(d.Loc, 0)
@@ -797,6 +808,13 @@ func (s *Server) diagnose(uri string) {
 				"severity": d.Severity, "source": "goravel-framework", "message": d.Message,
 			})
 		}
+	} else if path := uriToPath(uri); framework.IsTemplateFile(path) {
+		for _, d := range framework.TemplateDiagnostics(path, text, s.cat) {
+			diags = append(diags, map[string]any{
+				"range":    Range{offsetToPos(text, d.Start), offsetToPos(text, d.End)},
+				"severity": d.Severity, "source": "goravel-tmpl", "message": d.Message,
+			})
+		}
 	}
 	s.notify("textDocument/publishDiagnostics", map[string]any{"uri": uri, "diagnostics": diags})
 }
@@ -811,74 +829,84 @@ func (s *Server) codeAction(raw json.RawMessage) any {
 	_ = json.Unmarshal(raw, &p)
 	uri := p.TextDocument.URI
 	text, ok := s.docs[uri]
-	if !ok || !strings.HasSuffix(uri, ".go") {
+	path := uriToPath(uri)
+	if !ok || (!strings.HasSuffix(uri, ".go") && !framework.IsTemplateFile(path)) {
 		return nil
 	}
 	off := posToOffset(text, p.Range.Start)
-	fi := rawsql.Extract(uriToPath(uri), []byte(text), s.cat)
 	actions := []map[string]any{}
-	edit := func(title, kind string, start, end int, newText string) {
-		actions = append(actions, map[string]any{
-			"title": title, "kind": kind,
-			"edit": map[string]any{"changes": map[string]any{uri: []map[string]any{{
-				"range": Range{offsetToPos(text, start), offsetToPos(text, end)}, "newText": newText,
-			}}}},
-		})
-	}
-	if st, en, repl, ok := rawsql.ExpandStar(fi, s.cat, off); ok {
-		edit("Expand * to explicit columns", "refactor.rewrite", st, en, repl)
-	}
-	if at, code, name, ok := rawsql.GenerateRowStruct(fi, s.cat, off); ok {
-		edit("Generate row struct "+name, "refactor.extract", at, at, code)
-	}
-	if targetFile, insertAt, newText, title, ok := rawsql.AddMissingScanFields(fi, s.cat, off); ok {
-		targetURI := pathToURI(targetFile)
-		targetText := text
-		if filepath.Clean(targetFile) != filepath.Clean(uriToPath(uri)) {
-			if b, err := os.ReadFile(targetFile); err == nil {
-				targetText = string(b)
+
+	if strings.HasSuffix(uri, ".go") {
+		fi := rawsql.Extract(path, []byte(text), s.cat)
+		edit := func(title, kind string, start, end int, newText string) {
+			actions = append(actions, map[string]any{
+				"title": title, "kind": kind,
+				"edit": map[string]any{"changes": map[string]any{uri: []map[string]any{{
+					"range": Range{offsetToPos(text, start), offsetToPos(text, end)}, "newText": newText,
+				}}}},
+			})
+		}
+		if st, en, repl, ok := rawsql.ExpandStar(fi, s.cat, off); ok {
+			edit("Expand * to explicit columns", "refactor.rewrite", st, en, repl)
+		}
+		if at, code, name, ok := rawsql.GenerateRowStruct(fi, s.cat, off); ok {
+			edit("Generate row struct "+name, "refactor.extract", at, at, code)
+		}
+		if targetFile, insertAt, newText, title, ok := rawsql.AddMissingScanFields(fi, s.cat, off); ok {
+			targetURI := pathToURI(targetFile)
+			targetText := text
+			if filepath.Clean(targetFile) != filepath.Clean(path) {
+				if b, err := os.ReadFile(targetFile); err == nil {
+					targetText = string(b)
+				}
+			}
+			actions = append(actions, map[string]any{
+				"title": title, "kind": "quickfix",
+				"edit": map[string]any{"changes": map[string]any{targetURI: []map[string]any{{
+					"range": Range{offsetToPos(targetText, insertAt), offsetToPos(targetText, insertAt)}, "newText": newText,
+				}}}},
+			})
+		}
+		if d := fi.DocAt(off); d != nil {
+			cfg := indexer.ResolveDBConfig(s.cat)
+			if cfg.Database != "" && (cfg.Host != "" || cfg.Driver == "sqlite" || cfg.Driver == "sqlite3") {
+				actions = append(actions,
+					map[string]any{
+						"title": "Goravel: Explain SQL Query against DB",
+						"kind":  "quickfix",
+						"command": map[string]any{
+							"title":     "Goravel: Explain SQL Query against DB",
+							"command":   "goravel.explainQuery",
+							"arguments": []any{d.Text},
+						},
+					},
+					map[string]any{
+						"title": "Goravel: Preview Query Results (Live DB)",
+						"kind":  "quickfix",
+						"command": map[string]any{
+							"title":     "Goravel: Preview Query Results (Live DB)",
+							"command":   "goravel.previewQuery",
+							"arguments": []any{d.Text},
+						},
+					},
+				)
 			}
 		}
-		actions = append(actions, map[string]any{
-			"title": title, "kind": "quickfix",
-			"edit": map[string]any{"changes": map[string]any{targetURI: []map[string]any{{
-				"range": Range{offsetToPos(targetText, insertAt), offsetToPos(targetText, insertAt)}, "newText": newText,
-			}}}},
-		})
 	}
-	if d := fi.DocAt(off); d != nil {
-		cfg := indexer.ResolveDBConfig(s.cat)
-		if cfg.Database != "" && (cfg.Host != "" || cfg.Driver == "sqlite" || cfg.Driver == "sqlite3") {
-			actions = append(actions,
-				map[string]any{
-					"title": "Goravel: Explain SQL Query against DB",
-					"kind":  "quickfix",
-					"command": map[string]any{
-						"title":     "Goravel: Explain SQL Query against DB",
-						"command":   "goravel.explainQuery",
-						"arguments": []any{d.Text},
-					},
-				},
-				map[string]any{
-					"title": "Goravel: Preview Query Results (Live DB)",
-					"kind":  "quickfix",
-					"command": map[string]any{
-						"title":     "Goravel: Preview Query Results (Live DB)",
-						"command":   "goravel.previewQuery",
-						"arguments": []any{d.Text},
-					},
-				},
-			)
-		}
-	}
-	path := uriToPath(uri)
+
 	var fActions []framework.CodeAction
-	fActions = append(fActions, framework.RequestCodeActions(path, text, s.cat, off)...)
-	fActions = append(fActions, framework.ControllerCodeActions(path, text, s.cat, off)...)
-	fActions = append(fActions, framework.DriftCodeActions(path, text, s.cat, off)...)
-	fActions = append(fActions, framework.EnvAndLangCodeActions(path, text, s.cat, off)...)
+	if framework.IsTemplateFile(path) {
+		fActions = append(fActions, framework.TemplateCodeActions(path, text, s.cat, off)...)
+	} else {
+		fActions = append(fActions, framework.RequestCodeActions(path, text, s.cat, off)...)
+		fActions = append(fActions, framework.ControllerCodeActions(path, text, s.cat, off)...)
+		fActions = append(fActions, framework.ViewCodeActions(path, text, s.cat, off)...)
+		fActions = append(fActions, framework.DriftCodeActions(path, text, s.cat, off)...)
+		fActions = append(fActions, framework.EnvAndLangCodeActions(path, text, s.cat, off)...)
+	}
 	for _, a := range fActions {
 		changesByURI := map[string][]map[string]any{}
+		var missingFile, missingContent string
 		for _, ed := range a.Edits {
 			targetURI := uri
 			targetText := text
@@ -888,6 +916,10 @@ func (s *Server) codeAction(raw json.RawMessage) any {
 					targetText = doc
 				} else if b, err := os.ReadFile(ed.File); err == nil {
 					targetText = string(b)
+				} else {
+					targetText = ""
+					missingFile = ed.File
+					missingContent = ed.NewText
 				}
 			}
 			changesByURI[targetURI] = append(changesByURI[targetURI], map[string]any{
@@ -895,11 +927,19 @@ func (s *Server) codeAction(raw json.RawMessage) any {
 				"newText": ed.NewText,
 			})
 		}
-		actions = append(actions, map[string]any{
+		item := map[string]any{
 			"title": a.Title,
 			"kind":  a.Kind,
 			"edit":  map[string]any{"changes": changesByURI},
-		})
+		}
+		if missingFile != "" {
+			item["command"] = map[string]any{
+				"title":     a.Title,
+				"command":   "goravel.createFileIfMissing",
+				"arguments": []any{missingFile, missingContent},
+			}
+		}
+		actions = append(actions, item)
 	}
 	return actions
 }
@@ -913,6 +953,20 @@ func (s *Server) codeLens(raw json.RawMessage) any {
 	_ = json.Unmarshal(raw, &p)
 	path := filepath.Clean(uriToPath(p.TextDocument.URI))
 	var lenses []map[string]any
+	if framework.IsTemplateFile(path) {
+		for _, tl := range framework.TemplateCodeLenses(path, s.cat) {
+			pos := Position{tl.Line, tl.Col}
+			lenses = append(lenses, map[string]any{
+				"range": Range{pos, pos},
+				"command": map[string]any{
+					"title":     tl.Title,
+					"command":   "goravel.openLocation",
+					"arguments": []any{tl.File, tl.TLine, tl.TCol},
+				},
+			})
+		}
+		return lenses
+	}
 	for _, r := range s.cat.Routes {
 		if !r.CtrlLoc.Valid() || filepath.Clean(r.CtrlLoc.File) != path {
 			continue

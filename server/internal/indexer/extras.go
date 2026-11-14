@@ -8,33 +8,82 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 )
 
-func indexViews(c *Catalog, root string) {
-	viewDir := filepath.Join(root, "resources", "views")
-	_ = filepath.WalkDir(viewDir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		ext := strings.ToLower(filepath.Ext(d.Name()))
-		if ext != ".tmpl" && ext != ".html" && ext != ".gohtml" {
-			return nil
-		}
-		rel, err := filepath.Rel(viewDir, p)
-		if err != nil {
-			return nil
-		}
-		c.Views[filepath.ToSlash(rel)] = Location{File: p, Line: 0, Col: 0}
-		return nil
-	})
+var (
+	tmplActionRe  = regexp.MustCompile(`(?s)\{\{-?(.*?)-?\}\}`)
+	tmplDefineRe  = regexp.MustCompile(`^\s*define\s+"([^"]+)"`)
+	tmplIncludeRe = regexp.MustCompile(`^\s*(?:template|block)\s+"([^"]+)"(?:\s+(.+))?`)
+	tmplDotVarRe  = regexp.MustCompile(`(?:^|[\s(|,=:$])(?:\$)?\.([A-Za-z_][A-Za-z0-9_]*)`)
+	tmplBareDotRe = regexp.MustCompile(`(?:^|[\s(|])\.(\s|$|\)|\|)`)
+)
 
-	// Index template variables passed via View().Make("<view>", map[string]any{...}) in controllers & routes
+func indexViews(c *Catalog, root string) {
+	// 1. Collect Go files across app, bootstrap, packages, routes, and tests
 	var files []*parsedFile
-	files = append(files, walkGoFiles(filepath.Join(root, "app", "http", "controllers"))...)
-	files = append(files, walkGoFiles(filepath.Join(root, "routes"))...)
+	for _, sub := range []string{"app", "bootstrap", "packages", "routes", "tests"} {
+		files = append(files, walkGoFiles(filepath.Join(root, sub))...)
+	}
+
+	// 2. Discover package view directories from facades.View().LoadViewsFrom(...)
+	seenPkgDirs := map[string]bool{}
+	addPkgDir := func(dir string) {
+		if dir == "" {
+			return
+		}
+		clean := filepath.Clean(dir)
+		if seenPkgDirs[clean] {
+			return
+		}
+		seenPkgDirs[clean] = true
+		c.PackageViewDirs = append(c.PackageViewDirs, clean)
+	}
+	for _, pf := range files {
+		ast.Inspect(pf.file, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) < 1 {
+				return true
+			}
+			sel, ok := call.Fun.(*ast.SelectorExpr)
+			if !ok || sel.Sel.Name != "LoadViewsFrom" {
+				return true
+			}
+			if !isViewReceiver(sel.X) {
+				return true
+			}
+			if dir := resolveViewDirExpr(root, filepath.Dir(pf.path), call.Args[0]); dir != "" {
+				addPkgDir(dir)
+			}
+			return true
+		})
+	}
+	// Also discover standard packages/*/views directories if present on disk
+	if entries, err := os.ReadDir(filepath.Join(root, "packages")); err == nil {
+		for _, ent := range entries {
+			if ent.IsDir() {
+				cand := filepath.Join(root, "packages", ent.Name(), "views")
+				if st, err := os.Stat(cand); err == nil && st.IsDir() {
+					addPkgDir(cand)
+				}
+			}
+		}
+	}
+
+	// 3. Walk app views (resources/views) first, then package view directories
+	appViewDir := filepath.Join(root, "resources", "views")
+	walkAndIndexViewDir(c, root, appViewDir, "app")
+	for _, pkgDir := range c.PackageViewDirs {
+		if filepath.Clean(pkgDir) == filepath.Clean(appViewDir) {
+			continue
+		}
+		walkAndIndexViewDir(c, root, pkgDir, "package")
+	}
+
+	// 4. Index View().Make, View().First, View().Exists, View().Share, and path.View across Go files
 	for _, pf := range files {
 		for _, d := range pf.file.Decls {
 			fd, ok := d.(*ast.FuncDecl)
@@ -50,59 +99,459 @@ func indexViews(c *Catalog, root string) {
 			if ctrlLabel == "" && fd.Name != nil {
 				ctrlLabel = fd.Name.Name
 			}
+			routeForCtrl := ""
+			if fd.Recv != nil {
+				rName := recvName(fd.Recv)
+				for _, rt := range c.Routes {
+					if rt.Controller == rName && rt.Action == fd.Name.Name {
+						routeForCtrl = rt.Method + " " + rt.Path
+						break
+					}
+				}
+			}
+
+			localTypes := map[string]string{}
+			localMaps := map[string]*ast.CompositeLit{}
+			collectLocalVarsAndMaps(fd.Body, localTypes, localMaps, c)
+
 			ast.Inspect(fd.Body, func(n ast.Node) bool {
 				call, ok := n.(*ast.CallExpr)
-				if !ok || len(call.Args) < 2 {
+				if !ok || len(call.Args) == 0 {
 					return true
 				}
 				sel, ok := call.Fun.(*ast.SelectorExpr)
-				if !ok || (sel.Sel.Name != "Make" && sel.Sel.Name != "First") {
-					return true
-				}
-				if !isViewReceiver(sel.X) {
-					return true
-				}
-				viewName := stringLitValue(call.Args[0])
-				if viewName == "" {
-					return true
-				}
-				cl, ok := call.Args[1].(*ast.CompositeLit)
 				if !ok {
 					return true
 				}
-				keys := normalizeViewKeys(c, viewName)
-				for _, elt := range cl.Elts {
-					kv, ok := elt.(*ast.KeyValueExpr)
-					if !ok {
-						continue
+
+				// Check path.View("...")
+				if ident, ok := sel.X.(*ast.Ident); ok && ident.Name == "path" && sel.Sel.Name == "View" {
+					var parts []string
+					for _, arg := range call.Args {
+						if s := stringLitValue(arg); s != "" {
+							parts = append(parts, s)
+						}
 					}
-					k := stringLitValue(kv.Key)
-					if k == "" {
-						continue
+					if len(parts) > 0 {
+						vn := filepath.ToSlash(strings.Join(parts, "/"))
+						recordViewCaller(c, vn, ViewCaller{
+							ViewName:   vn,
+							Method:     "PathView",
+							Controller: ctrlLabel,
+							Route:      routeForCtrl,
+							Loc:        loc(pf, call.Args[0].Pos()),
+						})
 					}
-					vv := ViewVar{
-						Key:        k,
-						ValueExpr:  exprValueSummary(kv.Value),
+					return true
+				}
+
+				if !isViewReceiver(sel.X) {
+					return true
+				}
+
+				switch sel.Sel.Name {
+				case "Share":
+					if len(call.Args) >= 2 {
+						k := stringLitValue(call.Args[0])
+						if k != "" {
+							vv := ViewVar{
+								Key:        k,
+								ValueExpr:  exprValueSummary(call.Args[1]),
+								GoType:     inferExprModelType(call.Args[1], localTypes, c),
+								Controller: ctrlLabel,
+								Shared:     true,
+								Loc:        loc(pf, call.Args[0].Pos()),
+							}
+							c.SharedViewVars[k] = append(c.SharedViewVars[k], vv)
+						}
+					}
+				case "Exists":
+					if vn := stringLitValue(call.Args[0]); vn != "" {
+						recordViewCaller(c, vn, ViewCaller{
+							ViewName:   vn,
+							Method:     "Exists",
+							Controller: ctrlLabel,
+							Route:      routeForCtrl,
+							Loc:        loc(pf, call.Args[0].Pos()),
+						})
+					}
+				case "Make":
+					vn := stringLitValue(call.Args[0])
+					if vn == "" {
+						return true
+					}
+					recordViewCaller(c, vn, ViewCaller{
+						ViewName:   vn,
+						Method:     "Make",
 						Controller: ctrlLabel,
-						Loc:        loc(pf, kv.Key.Pos()),
+						Route:      routeForCtrl,
+						Loc:        loc(pf, call.Args[0].Pos()),
+					})
+					if len(call.Args) >= 2 {
+						if cl := resolveMapCompositeLit(call.Args[1], localMaps); cl != nil {
+							recordViewVarsFromMap(c, pf, []string{vn}, cl, ctrlLabel, localTypes)
+						}
 					}
-					for _, vk := range keys {
-						c.ViewVars[vk] = append(c.ViewVars[vk], vv)
+				case "First":
+					var viewNames []string
+					if sliceLit, ok := call.Args[0].(*ast.CompositeLit); ok {
+						for _, elt := range sliceLit.Elts {
+							if vn := stringLitValue(elt); vn != "" {
+								viewNames = append(viewNames, vn)
+								recordViewCaller(c, vn, ViewCaller{
+									ViewName:   vn,
+									Method:     "First",
+									Controller: ctrlLabel,
+									Route:      routeForCtrl,
+									Loc:        loc(pf, elt.Pos()),
+								})
+							}
+						}
+					}
+					if len(viewNames) > 0 && len(call.Args) >= 2 {
+						if cl := resolveMapCompositeLit(call.Args[1], localMaps); cl != nil {
+							recordViewVarsFromMap(c, pf, viewNames, cl, ctrlLabel, localTypes)
+						}
 					}
 				}
 				return true
 			})
 		}
 	}
+
+	// 5. Propagate ViewVars to included sub-templates ({{ template "sub" . }}) and propagate UsedVars upwards
+	propagateTemplateHierarchy(c)
+}
+
+func walkAndIndexViewDir(c *Catalog, root, viewDir, source string) {
+	_ = filepath.WalkDir(viewDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(d.Name()))
+		if ext != ".tmpl" && ext != ".html" && ext != ".gohtml" {
+			return nil
+		}
+		rel, err := filepath.Rel(viewDir, p)
+		if err != nil {
+			return nil
+		}
+		relSlash := filepath.ToSlash(rel)
+		relRoot := relSlash
+		if r, err := filepath.Rel(root, p); err == nil {
+			relRoot = filepath.ToSlash(r)
+		}
+		fileLoc := Location{File: p, Line: 0, Col: 0}
+		if existing := c.ViewItems[relSlash]; existing != nil {
+			// App view takes precedence; record package location as fallback/overridden
+			existing.PackageLocs = append(existing.PackageLocs, fileLoc)
+			return nil
+		}
+		vi := &ViewItem{
+			Name:       relSlash,
+			RelDisplay: relRoot,
+			Source:     source,
+			Loc:        fileLoc,
+		}
+		if b, err := os.ReadFile(p); err == nil {
+			parseTemplateMetadata(vi, p, string(b))
+		}
+		c.Views[relSlash] = vi.Loc
+		c.ViewItems[relSlash] = vi
+		return nil
+	})
+}
+
+func parseTemplateMetadata(vi *ViewItem, filePath, src string) {
+	seenVars := map[string]bool{}
+	matches := tmplActionRe.FindAllStringSubmatchIndex(src, -1)
+	for _, m := range matches {
+		bodyStart, bodyEnd := m[2], m[3]
+		body := src[bodyStart:bodyEnd]
+		trimmed := strings.TrimSpace(body)
+		if strings.HasPrefix(trimmed, "/*") {
+			continue
+		}
+		if dm := tmplDefineRe.FindStringSubmatchIndex(body); dm != nil {
+			nameStart := bodyStart + dm[2]
+			defName := src[nameStart : bodyStart+dm[3]]
+			line, col := offsetToLineCol(src, nameStart)
+			if vi.DefineName == "" {
+				vi.DefineName = defName
+				vi.DefineLoc = Location{File: filePath, Line: line, Col: col}
+			}
+			continue
+		}
+		if im := tmplIncludeRe.FindStringSubmatchIndex(body); im != nil {
+			nameStart := bodyStart + im[2]
+			target := src[nameStart : bodyStart+im[3]]
+			passDot := false
+			if im[4] >= 0 && im[5] >= 0 {
+				argStr := strings.TrimSpace(src[bodyStart+im[4] : bodyStart+im[5]])
+				if argStr == "." || argStr == "$" || strings.HasPrefix(argStr, ".") {
+					passDot = true
+				}
+			}
+			line, col := offsetToLineCol(src, nameStart)
+			vi.Includes = append(vi.Includes, TemplateInclude{
+				Target:  target,
+				PassDot: passDot,
+				Loc:     Location{File: filePath, Line: line, Col: col},
+			})
+			continue
+		}
+		for _, vm := range tmplDotVarRe.FindAllStringSubmatch(body, -1) {
+			vName := vm[1]
+			if vName != "" && !seenVars[vName] {
+				seenVars[vName] = true
+				vi.UsedVars = append(vi.UsedVars, vName)
+			}
+		}
+		if tmplBareDotRe.MatchString(body) {
+			vi.PassesDot = true
+		}
+	}
+}
+
+func offsetToLineCol(src string, off int) (int, int) {
+	if off < 0 {
+		return 0, 0
+	}
+	if off > len(src) {
+		off = len(src)
+	}
+	line := strings.Count(src[:off], "\n")
+	lastNL := strings.LastIndexByte(src[:off], '\n')
+	col := off - (lastNL + 1)
+	return line, col
+}
+
+func resolveViewDirExpr(root, fileDir string, expr ast.Expr) string {
+	if s := stringLitValue(expr); s != "" {
+		if filepath.IsAbs(s) {
+			return s
+		}
+		return filepath.Join(root, filepath.FromSlash(s))
+	}
+	call, ok := expr.(*ast.CallExpr)
+	if !ok {
+		return ""
+	}
+	sel, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return ""
+	}
+	pkgIdent, _ := sel.X.(*ast.Ident)
+	pkgName := ""
+	if pkgIdent != nil {
+		pkgName = pkgIdent.Name
+	}
+	var parts []string
+	for _, arg := range call.Args {
+		if s := stringLitValue(arg); s != "" {
+			parts = append(parts, filepath.FromSlash(s))
+		}
+	}
+	switch pkgName + "." + sel.Sel.Name {
+	case "path.Base":
+		return filepath.Join(append([]string{root}, parts...)...)
+	case "path.Resource":
+		return filepath.Join(append([]string{root, "resources"}, parts...)...)
+	case "path.View", "path.Views":
+		return filepath.Join(append([]string{root, "resources", "views"}, parts...)...)
+	case "path.App":
+		return filepath.Join(append([]string{root, "app"}, parts...)...)
+	case "filepath.Join":
+		if len(parts) > 0 {
+			if filepath.IsAbs(parts[0]) {
+				return filepath.Join(parts...)
+			}
+			return filepath.Join(append([]string{root}, parts...)...)
+		}
+	}
+	_ = fileDir
+	return ""
+}
+
+func collectLocalVarsAndMaps(body *ast.BlockStmt, localTypes map[string]string, localMaps map[string]*ast.CompositeLit, c *Catalog) {
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch stmt := n.(type) {
+		case *ast.DeclStmt:
+			gd, ok := stmt.Decl.(*ast.GenDecl)
+			if !ok || gd.Tok != token.VAR {
+				return true
+			}
+			for _, sp := range gd.Specs {
+				vs, ok := sp.(*ast.ValueSpec)
+				if !ok {
+					continue
+				}
+				tName := cleanModelType(exprString(vs.Type))
+				for i, ident := range vs.Names {
+					if tName != "" {
+						localTypes[ident.Name] = tName
+					} else if i < len(vs.Values) {
+						if inferred := inferExprModelType(vs.Values[i], localTypes, c); inferred != "" {
+							localTypes[ident.Name] = inferred
+						}
+					}
+					if i < len(vs.Values) {
+						if cl, ok := vs.Values[i].(*ast.CompositeLit); ok {
+							localMaps[ident.Name] = cl
+						}
+					}
+				}
+			}
+		case *ast.AssignStmt:
+			for i, lhs := range stmt.Lhs {
+				ident, ok := lhs.(*ast.Ident)
+				if !ok || i >= len(stmt.Rhs) {
+					continue
+				}
+				rhs := stmt.Rhs[i]
+				if inferred := inferExprModelType(rhs, localTypes, c); inferred != "" {
+					localTypes[ident.Name] = inferred
+				}
+				if cl, ok := rhs.(*ast.CompositeLit); ok {
+					localMaps[ident.Name] = cl
+				}
+			}
+		}
+		return true
+	})
+}
+
+func resolveMapCompositeLit(expr ast.Expr, localMaps map[string]*ast.CompositeLit) *ast.CompositeLit {
+	if cl, ok := expr.(*ast.CompositeLit); ok {
+		return cl
+	}
+	if ident, ok := expr.(*ast.Ident); ok && localMaps != nil {
+		return localMaps[ident.Name]
+	}
+	return nil
+}
+
+func inferExprModelType(expr ast.Expr, localTypes map[string]string, c *Catalog) string {
+	if expr == nil {
+		return ""
+	}
+	switch x := expr.(type) {
+	case *ast.Ident:
+		if localTypes != nil {
+			if t := localTypes[x.Name]; t != "" {
+				return t
+			}
+		}
+	case *ast.UnaryExpr:
+		return inferExprModelType(x.X, localTypes, c)
+	case *ast.CompositeLit:
+		tName := cleanModelType(exprString(x.Type))
+		if c != nil && (c.Models[tName] != nil || c.Structs[tName] != nil) {
+			return tName
+		}
+	}
+	return ""
+}
+
+func recordViewCaller(c *Catalog, rawName string, caller ViewCaller) {
+	if vi := c.LookupView(rawName); vi != nil {
+		vi.Callers = append(vi.Callers, caller)
+	}
+}
+
+func recordViewVarsFromMap(c *Catalog, pf *parsedFile, viewNames []string, cl *ast.CompositeLit, ctrlLabel string, localTypes map[string]string) {
+	var allKeys []string
+	for _, vn := range viewNames {
+		allKeys = append(allKeys, normalizeViewKeys(c, vn)...)
+	}
+	for _, elt := range cl.Elts {
+		kv, ok := elt.(*ast.KeyValueExpr)
+		if !ok {
+			continue
+		}
+		k := stringLitValue(kv.Key)
+		if k == "" {
+			continue
+		}
+		vv := ViewVar{
+			Key:        k,
+			ValueExpr:  exprValueSummary(kv.Value),
+			GoType:     inferExprModelType(kv.Value, localTypes, c),
+			Controller: ctrlLabel,
+			Loc:        loc(pf, kv.Key.Pos()),
+		}
+		for _, vk := range allKeys {
+			c.ViewVars[vk] = append(c.ViewVars[vk], vv)
+		}
+	}
+}
+
+func propagateTemplateHierarchy(c *Catalog) {
+	for _, parent := range c.ViewItems {
+		if len(parent.Includes) == 0 {
+			continue
+		}
+		parentKeys := normalizeViewKeys(c, parent.Name)
+		if parent.DefineName != "" {
+			parentKeys = append(parentKeys, parent.DefineName)
+		}
+		var parentVars []ViewVar
+		for _, pk := range parentKeys {
+			parentVars = append(parentVars, c.ViewVars[pk]...)
+		}
+		usedSet := map[string]bool{}
+		for _, uv := range parent.UsedVars {
+			usedSet[uv] = true
+		}
+
+		for _, inc := range parent.Includes {
+			child := c.LookupView(inc.Target)
+			if child == nil {
+				continue
+			}
+			if inc.PassDot {
+				// Propagate child's UsedVars up to parent so controller diagnostics know child uses them
+				for _, cuv := range child.UsedVars {
+					if !usedSet[cuv] {
+						usedSet[cuv] = true
+						parent.UsedVars = append(parent.UsedVars, cuv)
+					}
+				}
+				if child.PassesDot {
+					parent.PassesDot = true
+				}
+				// Propagate parent's ViewVars down to child so child template has completion/hover/definition
+				if len(parentVars) > 0 {
+					childKeys := normalizeViewKeys(c, child.Name)
+					for _, pv := range parentVars {
+						inheritedVar := pv
+						if inheritedVar.Inherited == "" {
+							inheritedVar.Inherited = parent.Name
+						}
+						for _, ck := range childKeys {
+							c.ViewVars[ck] = append(c.ViewVars[ck], inheritedVar)
+						}
+					}
+				}
+			}
+		}
+	}
 }
 
 func isViewReceiver(e ast.Expr) bool {
-	call, ok := e.(*ast.CallExpr)
-	if !ok {
-		return false
+	switch x := e.(type) {
+	case *ast.CallExpr:
+		if sel, ok := x.Fun.(*ast.SelectorExpr); ok {
+			return sel.Sel.Name == "View" || sel.Sel.Name == "MakeView"
+		}
+	case *ast.Ident:
+		low := strings.ToLower(x.Name)
+		return strings.Contains(low, "view")
+	case *ast.SelectorExpr:
+		low := strings.ToLower(x.Sel.Name)
+		return strings.Contains(low, "view")
 	}
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	return ok && sel.Sel.Name == "View"
+	return false
 }
 
 func normalizeViewKeys(c *Catalog, raw string) []string {

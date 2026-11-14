@@ -527,3 +527,230 @@ func Grpc() {
 		}
 	}
 }
+
+func TestP5ViewFacadeAndTemplateLSP(t *testing.T) {
+	root := t.TempDir()
+
+	// 1. User model for nested struct field completion/definition in .tmpl
+	modelPath := writeTempFile(t, root, "app/models/user.go", `package models
+type User struct {
+	ID    uint   `+"`gorm:\"column:id\"`"+`
+	Email string `+"`gorm:\"column:email\"`"+`
+}
+func (*User) TableName() string { return "users" }
+`)
+
+	// 2. Package ServiceProvider registering LoadViewsFrom + View().Share
+	providerPath := writeTempFile(t, root, "packages/viewtest/service_provider.go", `package viewtest
+import (
+	"github.com/goravel/framework/contracts/foundation"
+	"github.com/goravel/framework/support/path"
+	"goravel/app/facades"
+)
+type ServiceProvider struct{}
+func (r *ServiceProvider) Boot(app foundation.Application) {
+	facades.View().LoadViewsFrom(path.Base("packages", "viewtest", "views"))
+	facades.View().Share("site_name", "Goravel Portal")
+}
+`)
+	pkgOnlyPath := writeTempFile(t, root, "packages/viewtest/views/package_only.tmpl", `<p>package-only: {{ .name }} - {{ .site_name }}</p>`)
+	pkgSharedPath := writeTempFile(t, root, "packages/viewtest/views/shared.tmpl", `<p>package-shared: {{ .name }}</p>`)
+
+	// 3. App views (including override of shared.tmpl and nested admin/index.tmpl -> admin/header.tmpl)
+	appSharedPath := writeTempFile(t, root, "resources/views/shared.tmpl", `<p>app-shared: {{ .name }}</p>`)
+	headerPath := writeTempFile(t, root, "resources/views/admin/header.tmpl", `{{ define "admin/header.tmpl" }}
+<header>{{ .header_title }} | {{ .site_name }} | {{ .user.Email }}</header>
+{{ end }}`)
+	adminIdxPath := writeTempFile(t, root, "resources/views/admin/index.tmpl", `{{ define "admin/index.tmpl" }}
+{{ template "admin/header.tmpl" . }}
+{{ range $idx, $u := .users }}
+  <p>{{ $idx }}: {{ .headline }}</p>
+{{ end }}
+{{ end }}`)
+
+	// 4. Controller & Routes using Make, First, Exists, Shared
+	ctrlPath := writeTempFile(t, root, "app/http/controllers/view_controller.go", `package controllers
+import (
+	"github.com/goravel/framework/contracts/http"
+	"goravel/app/facades"
+	"goravel/app/models"
+)
+type ViewController struct{}
+func (c *ViewController) Admin(ctx http.Context) http.Response {
+	var user models.User
+	_ = facades.View().Exists("package_only.tmpl")
+	_ = facades.View().Exists("shared.tmpl")
+	_ = facades.View().Shared("site_name")
+	return ctx.Response().View().Make("admin/index.tmpl", map[string]any{
+		"headline":     "Dashboard",
+		"header_title": "UsedInHeaderPartial",
+		"user":         user,
+		"users":        []models.User{user},
+	})
+}
+func (c *ViewController) Fallback(ctx http.Context) http.Response {
+	return ctx.Response().View().First([]string{"nonexistent_custom.tmpl", "package_only.tmpl"}, map[string]any{
+		"name": "Goravel",
+	})
+}
+func (c *ViewController) Missing(ctx http.Context) http.Response {
+	return ctx.Response().View().Make("admin/new_report.tmpl", map[string]any{
+		"report_name": "Q4",
+	})
+}
+`)
+
+	cat := indexer.Build(root)
+
+	// Verify 1: LoadViewsFrom & App Override Precedence
+	pkgVi := cat.LookupView("package_only.tmpl")
+	if pkgVi == nil || pkgVi.Source != "package" || filepath.Clean(pkgVi.Loc.File) != filepath.Clean(pkgOnlyPath) {
+		t.Fatalf("expected package_only.tmpl indexed from package view dir, got %+v", pkgVi)
+	}
+	sharedVi := cat.LookupView("shared.tmpl")
+	if sharedVi == nil || sharedVi.Source != "app" || filepath.Clean(sharedVi.Loc.File) != filepath.Clean(appSharedPath) || len(sharedVi.PackageLocs) != 1 || filepath.Clean(sharedVi.PackageLocs[0].File) != filepath.Clean(pkgSharedPath) {
+		t.Fatalf("expected shared.tmpl to resolve to app view and record package fallback, got %+v", sharedVi)
+	}
+
+	// Verify 2: Diagnostics on controller (no false-positive on package_only.tmpl, First fallback, or header_title used in partial; warning only on admin/new_report.tmpl)
+	ctrlBytes, _ := os.ReadFile(ctrlPath)
+	ctrlSrc := string(ctrlBytes)
+	vDiags := framework.ViewDiagnostics(ctrlPath, ctrlSrc, cat)
+	for _, d := range vDiags {
+		if strings.Contains(d.Message, "package_only.tmpl") || strings.Contains(d.Message, "First") || strings.Contains(d.Message, "header_title") {
+			t.Errorf("unexpected diagnostic: %+v", d)
+		}
+	}
+	hasMissingReportDiag := false
+	for _, d := range vDiags {
+		if strings.Contains(d.Message, "admin/new_report.tmpl") {
+			hasMissingReportDiag = true
+		}
+	}
+	if !hasMissingReportDiag {
+		t.Errorf("expected missing view diagnostic for admin/new_report.tmpl, got %+v", vDiags)
+	}
+
+	// Verify 3: Quick Fix to scaffold missing view template from View().Make("admin/new_report.tmpl", ...)
+	missingOff := strings.Index(ctrlSrc, "admin/new_report.tmpl") + 5
+	vActions := framework.ViewCodeActions(ctrlPath, ctrlSrc, cat, missingOff)
+	if len(vActions) == 0 || len(vActions[0].Edits) == 0 || !strings.Contains(vActions[0].Edits[0].NewText, "{{ .report_name }}") {
+		t.Errorf("expected Quick Fix to create admin/new_report.tmpl with report_name placeholder, got %+v", vActions)
+	}
+
+	// Verify 4: Go ViewLocations on Exists("shared.tmpl") returns both app view and overridden package view
+	existsSharedOff := strings.Index(ctrlSrc, `"shared.tmpl"`) + 3
+	locs := framework.ViewLocations(ctrlPath, ctrlSrc, cat, existsSharedOff)
+	if len(locs) != 2 {
+		t.Errorf("expected 2 locations (app + overridden package) for shared.tmpl, got %+v", locs)
+	}
+
+	// Verify 5: .tmpl Completions (partial include, nested struct field, inherited var, shared var, local $var)
+	headerBytes, _ := os.ReadFile(headerPath)
+	headerSrc := string(headerBytes)
+
+	// 5a: Nested struct field completion on `.user.`
+	userFieldOff := strings.Index(headerSrc, ".user.Email") + len(".user.")
+	fieldItems := framework.TemplateCompletions(headerPath, headerSrc, cat, userFieldOff)
+	hasEmailField := false
+	for _, it := range fieldItems {
+		if it.Label == "Email" {
+			hasEmailField = true
+		}
+	}
+	if !hasEmailField {
+		t.Errorf("expected nested struct field completion 'Email' on .user., got %+v", fieldItems)
+	}
+
+	// 5b: Go-to-Definition on `.user.Email` jumps to User struct in app/models/user.go
+	emailDefs := framework.TemplateDefinition(headerPath, headerSrc, cat, userFieldOff+2)
+	if len(emailDefs) == 0 || filepath.Clean(emailDefs[0].File) != filepath.Clean(modelPath) {
+		t.Errorf("expected definition on .user.Email to jump to %s, got %+v", modelPath, emailDefs)
+	}
+
+	// 5c: Go-to-Definition on shared var `.site_name` jumps to facades.View().Share in service_provider.go
+	siteNameOff := strings.Index(headerSrc, ".site_name") + 3
+	siteDefs := framework.TemplateDefinition(headerPath, headerSrc, cat, siteNameOff)
+	if len(siteDefs) == 0 || filepath.Clean(siteDefs[0].File) != filepath.Clean(providerPath) {
+		t.Errorf("expected definition on .site_name to jump to %s, got %+v", providerPath, siteDefs)
+	}
+
+	// 5d: Go-to-Definition on `{{ template "admin/header.tmpl" . }}` in admin/index.tmpl jumps to header.tmpl
+	adminBytes, _ := os.ReadFile(adminIdxPath)
+	adminSrc := string(adminBytes)
+	incOff := strings.Index(adminSrc, `"admin/header.tmpl"`) + 4
+	incDefs := framework.TemplateDefinition(adminIdxPath, adminSrc, cat, incOff)
+	if len(incDefs) == 0 || filepath.Clean(incDefs[0].File) != filepath.Clean(headerPath) {
+		t.Errorf("expected definition on template include to jump to %s, got %+v", headerPath, incDefs)
+	}
+
+	// 5e: Local variable $idx hover & definition in admin/index.tmpl
+	idxUseOff := strings.LastIndex(adminSrc, "$idx") + 2
+	idxHov := framework.TemplateHover(adminIdxPath, adminSrc, cat, idxUseOff)
+	if idxHov == nil || !strings.Contains(idxHov.Markdown, "Local Template Variable") {
+		t.Errorf("expected local template variable hover on $idx, got %+v", idxHov)
+	}
+
+	// Verify 6: Template Diagnostics (unclosed block & missing included partial)
+	brokenTpl := "{{ define \"broken.tmpl\" }}\n{{ template \"missing_partial.tmpl\" . }}\n{{ if .cond }}\n<p>unclosed</p>\n{{ end }}"
+	tDiags := framework.TemplateDiagnostics(filepath.Join(root, "resources/views/broken.tmpl"), brokenTpl, cat)
+	hasMissingPartial, hasUnclosedBlock := false, false
+	for _, d := range tDiags {
+		if strings.Contains(d.Message, "missing_partial.tmpl") {
+			hasMissingPartial = true
+		}
+		if strings.Contains(d.Message, "Unclosed") {
+			hasUnclosedBlock = true
+		}
+	}
+	if !hasMissingPartial || !hasUnclosedBlock {
+		t.Errorf("expected missing partial and unclosed block diagnostics, got %+v", tDiags)
+	}
+
+	// Verify 7: Template CodeLens (Overrides package view on shared.tmpl, Included by on admin/header.tmpl)
+	sharedLenses := framework.TemplateCodeLenses(appSharedPath, cat)
+	hasOverrideLens := false
+	for _, l := range sharedLenses {
+		if strings.Contains(l.Title, "Overrides package view") {
+			hasOverrideLens = true
+		}
+	}
+	if !hasOverrideLens {
+		t.Errorf("expected 'Overrides package view' CodeLens on resources/views/shared.tmpl, got %+v", sharedLenses)
+	}
+
+	headerLenses := framework.TemplateCodeLenses(headerPath, cat)
+	hasIncludedByLens := false
+	for _, l := range headerLenses {
+		if strings.Contains(l.Title, "Included by admin/index.tmpl") {
+			hasIncludedByLens = true
+		}
+	}
+	if !hasIncludedByLens {
+		t.Errorf("expected 'Included by admin/index.tmpl' CodeLens on admin/header.tmpl, got %+v", headerLenses)
+	}
+
+	// Verify 8: Cross-file Rename of template variable `.headline` across controller and .tmpl
+	var out bytes.Buffer
+	srv := New(strings.NewReader(""), &out)
+	srv.root = root
+	srv.cat = cat
+	adminURI := pathToURI(adminIdxPath)
+	srv.docs[adminURI] = adminSrc
+	headlineOff := strings.Index(adminSrc, ".headline") + 3
+	pos := offsetToPos(adminSrc, headlineOff)
+	rawRename, _ := json.Marshal(map[string]any{
+		"textDocument": map[string]any{"uri": adminURI},
+		"position":     pos,
+		"newName":      "page_title",
+	})
+	edit := srv.rename(rawRename)
+	editMap, ok := edit.(map[string]any)
+	if !ok {
+		t.Fatalf("expected rename workspace edit map, got %+v", edit)
+	}
+	changes, _ := editMap["changes"].(map[string][]map[string]any)
+	if len(changes[adminURI]) == 0 || len(changes[pathToURI(ctrlPath)]) == 0 {
+		t.Errorf("expected cross-file rename edits in both admin/index.tmpl and view_controller.go, got %+v", changes)
+	}
+}

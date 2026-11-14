@@ -2,7 +2,7 @@
   "name": "goravel-vscode",
   "displayName": "Goravel",
   "description": "Goravel tooling: raw SQL LSP, ORM query builder intelligence, Config, Routes, Validation Rules, and Artisan CLI for Go projects",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "rusmanplatd",
   "repository": {
     "type": "git",
@@ -19,10 +19,26 @@
   ],
   "activationEvents": [
     "workspaceContains:artisan",
-    "workspaceContains:app/models"
+    "workspaceContains:app/models",
+    "onLanguage:goravel-tmpl"
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "languages": [
+      {
+        "id": "goravel-tmpl",
+        "aliases": [
+          "Go HTML Template (Goravel)",
+          "Goravel Template",
+          "gotmpl"
+        ],
+        "extensions": [
+          ".tmpl",
+          ".gohtml"
+        ],
+        "configuration": "./language-configuration.tmpl.json"
+      }
+    ],
     "configuration": {
       "title": "Goravel",
       "properties": {
@@ -183,6 +199,10 @@
         "title": "Goravel: Artisan make:test"
       },
       {
+        "command": "goravel.artisan.makeView",
+        "title": "Goravel: Artisan make:view"
+      },
+      {
         "command": "goravel.artisan.migrate",
         "title": "Goravel: Artisan migrate",
         "icon": "$(play)"
@@ -330,6 +350,11 @@
           "command": "goravel.artisan.makeTest",
           "when": "resourcePath =~ /\\/tests$/",
           "group": "goravel@1"
+        },
+        {
+          "command": "goravel.artisan.makeView",
+          "when": "resourcePath =~ /\\/resources\\/views(\\/|$)/",
+          "group": "goravel@1"
         }
       ]
     },
@@ -337,6 +362,14 @@
       {
         "language": "go",
         "path": "./snippets/goravel.code-snippets"
+      },
+      {
+        "language": "goravel-tmpl",
+        "path": "./snippets/goravel-tmpl.code-snippets"
+      },
+      {
+        "language": "html",
+        "path": "./snippets/goravel-tmpl.code-snippets"
       }
     ],
     "grammars": [
@@ -348,6 +381,17 @@
         ],
         "embeddedLanguages": {
           "meta.embedded.block.sql": "sql"
+        }
+      },
+      {
+        "language": "goravel-tmpl",
+        "scopeName": "text.html.goravel-tmpl",
+        "path": "./syntaxes/goravel-tmpl.tmLanguage.json",
+        "embeddedLanguages": {
+          "meta.embedded.block.goravel-tmpl": "go",
+          "text.html.basic": "html",
+          "source.css": "css",
+          "source.js": "javascript"
         }
       }
     ]
