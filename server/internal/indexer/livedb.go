@@ -19,7 +19,7 @@ func indexLiveDBIfEnabled(c *Catalog, root string) {
 	if !LiveDBEnabled {
 		return
 	}
-	IntrospectLiveDB(c)
+	introspectLiveDBWithConfig(c, resolveDBConfigUnlocked(c))
 }
 
 type dbConnConfig struct {
@@ -31,11 +31,11 @@ type dbConnConfig struct {
 	Password string
 }
 
-func configString(c *Catalog, key string) string {
+func configStringUnlocked(c *Catalog, key string) string {
 	if c == nil {
 		return ""
 	}
-	ci := c.Config(key)
+	ci := c.Configs[key]
 	if ci == nil {
 		return ""
 	}
@@ -53,18 +53,25 @@ func configString(c *Catalog, key string) string {
 
 // ResolveDBConfig reads DB_* settings from .env and falls back to config/database.go.
 func ResolveDBConfig(c *Catalog) dbConnConfig {
+	if c == nil {
+		return dbConnConfig{}
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return resolveDBConfigUnlocked(c)
+}
+
+func resolveDBConfigUnlocked(c *Catalog) dbConnConfig {
 	var cfg dbConnConfig
 	if c == nil {
 		return cfg
 	}
-	c.mu.RLock()
 	env := func(k string) string { return c.EnvVars[k] }
 	root := c.Root
-	c.mu.RUnlock()
 
 	cfg.Driver = strings.ToLower(env("DB_CONNECTION"))
 	if cfg.Driver == "" {
-		cfg.Driver = strings.ToLower(configString(c, "database.default"))
+		cfg.Driver = strings.ToLower(configStringUnlocked(c, "database.default"))
 	}
 	if cfg.Driver == "" {
 		cfg.Driver = "postgres"
@@ -75,7 +82,7 @@ func ResolveDBConfig(c *Catalog) dbConnConfig {
 		if v := env(envKey); v != "" {
 			return v
 		}
-		return configString(c, prefix+cfgField)
+		return configStringUnlocked(c, prefix+cfgField)
 	}
 
 	cfg.Host = pick("DB_HOST", "host")
@@ -121,7 +128,15 @@ func (cfg dbConnConfig) validate() error {
 
 // IntrospectLiveDB queries schema columns and routines for Postgres, MySQL, SQLite, or SQL Server.
 func IntrospectLiveDB(c *Catalog) {
-	cfg := ResolveDBConfig(c)
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	introspectLiveDBWithConfig(c, resolveDBConfigUnlocked(c))
+}
+
+func introspectLiveDBWithConfig(c *Catalog, cfg dbConnConfig) {
 	if err := cfg.validate(); err != nil {
 		return
 	}
