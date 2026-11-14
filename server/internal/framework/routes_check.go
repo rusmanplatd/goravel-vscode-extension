@@ -19,6 +19,9 @@ var (
 	swagRouterRe = regexp.MustCompile(`@Router\s+(\S+)\s+\[([a-zA-Z]+)\]`)
 	swagTypeRe   = regexp.MustCompile(`(?:@Param|@Success|@Failure)\s+[^\n]*?\b(?:requests|models|responses)\.(\w+)`)
 	reqRefRe     = regexp.MustCompile(`\brequests\.(\w+)`)
+	modelSliceRe = regexp.MustCompile(`\[\]\*?models\.(\w+)`)
+	modelRefRe   = regexp.MustCompile(`\bmodels\.(\w+)`)
+	queryCallRe  = regexp.MustCompile(`\.Query(Int64|Int|Bool|Array|Map)?\(\s*"([^"]+)"`)
 )
 
 func isControllerFile(path string) bool {
@@ -212,16 +215,54 @@ func ControllerCodeActions(path, src string, cat *indexer.Catalog, goOff int) []
 			continue
 		}
 		var b strings.Builder
+		tag := strings.TrimSuffix(ctrl, "Controller")
+		if tag == "" {
+			tag = r.Module
+		}
 		fmt.Fprintf(&b, "// %s godoc\n", fd.Name.Name)
-		fmt.Fprintf(&b, "// @Summary %s\n", fd.Name.Name)
+		fmt.Fprintf(&b, "// @Summary %s %s\n", fd.Name.Name, tag)
+		if tag != "" {
+			fmt.Fprintf(&b, "// @Tags %s\n", tag)
+		}
+		fmt.Fprintf(&b, "// @Accept json\n")
+		fmt.Fprintf(&b, "// @Produce json\n")
+		if hasAuthMiddleware(r.Middlewares) {
+			fmt.Fprintf(&b, "// @Security BearerAuth\n")
+		}
 		for _, p := range r.Params {
 			fmt.Fprintf(&b, "// @Param %s path string true %q\n", p, p)
 		}
-		if reqName := findRequestStructInFunc(src, fset, fd); reqName != "" {
-			fmt.Fprintf(&b, "// @Param request body requests.%s true \"Request payload\"\n", reqName)
+		seenQuery := map[string]bool{}
+		for _, qp := range findQueryParamsInFunc(src, fset, fd) {
+			seenQuery[qp.name] = true
+			fmt.Fprintf(&b, "// @Param %s query %s false %q\n", qp.name, qp.swagType, qp.name)
 		}
-		fmt.Fprintf(&b, "// @Success 200 {object} map[string]any\n")
-		fmt.Fprintf(&b, "// @Router %s [%s]\n", r.Path, strings.ToLower(r.Method))
+		if reqName := findRequestStructInFunc(src, fset, fd); reqName != "" {
+			if (r.Method == "GET" || r.Method == "DELETE") && cat != nil {
+				if st := cat.Struct(reqName); st != nil && len(st.Fields) > 0 {
+					for _, fld := range st.Fields {
+						k := fieldTagKey(fld)
+						if seenQuery[k] {
+							continue
+						}
+						seenQuery[k] = true
+						reqBool := !strings.HasPrefix(fld.GoType, "*")
+						fmt.Fprintf(&b, "// @Param %s query %s %t %q\n", k, swaggerParamType(fld.GoType), reqBool, k)
+					}
+				} else {
+					fmt.Fprintf(&b, "// @Param request query requests.%s false \"Query parameters\"\n", reqName)
+				}
+			} else {
+				fmt.Fprintf(&b, "// @Param request body requests.%s true \"Request payload\"\n", reqName)
+			}
+		}
+		successCode := 200
+		if r.Method == "POST" && (fd.Name.Name == "Store" || fd.Name.Name == "Create") {
+			successCode = 201
+		}
+		successTarget := inferResponseModelInFunc(src, fset, fd)
+		fmt.Fprintf(&b, "// @Success %d %s\n", successCode, successTarget)
+		fmt.Fprintf(&b, "// @Router %s [%s]\n", swaggerPath(r.Path), strings.ToLower(r.Method))
 		return []CodeAction{{
 			Title: fmt.Sprintf("Generate Swagger comments for %s (%s %s)", fd.Name.Name, r.Method, r.Path),
 			Kind:  "refactor",
@@ -229,6 +270,98 @@ func ControllerCodeActions(path, src string, cat *indexer.Catalog, goOff int) []
 		}}
 	}
 	return nil
+}
+
+type queryParamInfo struct {
+	name     string
+	swagType string
+}
+
+func findQueryParamsInFunc(src string, fset *token.FileSet, fd *ast.FuncDecl) []queryParamInfo {
+	if fd.Body == nil {
+		return nil
+	}
+	s := fset.Position(fd.Body.Pos()).Offset
+	e := fset.Position(fd.Body.End()).Offset
+	if s < 0 || e > len(src) || s >= e {
+		return nil
+	}
+	seen := map[string]bool{}
+	var out []queryParamInfo
+	for _, m := range queryCallRe.FindAllStringSubmatch(src[s:e], -1) {
+		kind, name := m[1], m[2]
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		st := "string"
+		switch kind {
+		case "Int", "Int64":
+			st = "integer"
+		case "Bool":
+			st = "boolean"
+		}
+		out = append(out, queryParamInfo{name: name, swagType: st})
+	}
+	return out
+}
+
+func inferResponseModelInFunc(src string, fset *token.FileSet, fd *ast.FuncDecl) string {
+	if fd.Body == nil {
+		return "{object} map[string]any"
+	}
+	s := fset.Position(fd.Body.Pos()).Offset
+	e := fset.Position(fd.Body.End()).Offset
+	if s < 0 || e > len(src) || s >= e {
+		return "{object} map[string]any"
+	}
+	body := src[s:e]
+	if m := modelSliceRe.FindStringSubmatch(body); m != nil {
+		return "{array} models." + m[1]
+	}
+	if m := modelRefRe.FindStringSubmatch(body); m != nil && !strings.HasSuffix(m[1], "OriginalTableName") && !strings.HasSuffix(m[1], "OriginalSchemaName") {
+		return "{object} models." + m[1]
+	}
+	return "{object} map[string]any"
+}
+
+func hasAuthMiddleware(mws []string) bool {
+	for _, mw := range mws {
+		l := strings.ToLower(mw)
+		if strings.Contains(l, "jwt") || strings.Contains(l, "auth") || strings.Contains(l, "bearer") || strings.Contains(l, "sanctum") {
+			return true
+		}
+	}
+	return false
+}
+
+func swaggerParamType(goType string) string {
+	t := strings.TrimPrefix(goType, "*")
+	switch t {
+	case "int", "int32", "int64", "uint", "uint32", "uint64":
+		return "integer"
+	case "float32", "float64":
+		return "number"
+	case "bool":
+		return "boolean"
+	default:
+		return "string"
+	}
+}
+
+func swaggerPath(p string) string {
+	segs := strings.Split(p, "/")
+	for i, seg := range segs {
+		if strings.HasPrefix(seg, ":") && len(seg) > 1 {
+			segs[i] = "{" + seg[1:] + "}"
+		} else if strings.HasPrefix(seg, "{") && strings.HasSuffix(seg, "}") {
+			inner := seg[1 : len(seg)-1]
+			if colon := strings.IndexByte(inner, ':'); colon > 0 {
+				segs[i] = "{" + inner[:colon] + "}"
+			}
+		}
+	}
+	return strings.Join(segs, "/")
 }
 
 func findRequestStructInFunc(src string, fset *token.FileSet, fd *ast.FuncDecl) string {

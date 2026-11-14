@@ -25,6 +25,7 @@ var (
 	bpFkRe         = regexp.MustCompile(`\b(?:table|blueprint)\.Foreign\(\s*"([^"]+)"\s*\)\.References\(\s*"([^"]+)"\s*\)\.On\(\s*"([^"]+)"\s*\)`)
 	bpIdxRe        = regexp.MustCompile(`\b(?:table|blueprint)\.(Index|Unique|Primary)\(\s*([^)]+)\)`)
 	createIdxRe    = regexp.MustCompile("(?is)CREATE\\s+(UNIQUE\\s+)?INDEX\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?[\\w.\"]+\\s+ON\\s+(?:`\\s*\\+\\s*(\\w+)\\s*\\+\\s*`|([\\w.\"]+))\\s*\\(([^)]+)\\)")
+	migSigRe       = regexp.MustCompile(`Signature\(\)\s*string\s*\{\s*return\s+"([^"]+)"`)
 	quotedStrRe    = regexp.MustCompile(`"([^"]+)"`)
 	skipWord       = map[string]bool{"constraint": true, "primary": true, "unique": true, "foreign": true, "check": true, "index": true, "key": true, "like": true, "exclude": true}
 )
@@ -52,13 +53,20 @@ func indexMigrations(c *Catalog, root string) {
 		if err != nil {
 			continue
 		}
+		src := string(data)
 		folder := strings.Split(relSlash, "/")[0]
-		tname := parseMigration(c, p, string(data))
+		tname := parseMigration(c, p, src)
+		name := strings.TrimSuffix(filepath.Base(p), ".go")
+		sig := name
+		if sm := migSigRe.FindStringSubmatch(src); len(sm) >= 2 && sm[1] != "" {
+			sig = sm[1]
+		}
 		c.Migrations = append(c.Migrations, &MigrationItem{
-			Name:   strings.TrimSuffix(filepath.Base(p), ".go"),
-			Folder: folder,
-			Table:  tname,
-			Loc:    Location{File: p, Line: 0, Col: 0},
+			Name:      name,
+			Signature: sig,
+			Folder:    folder,
+			Table:     tname,
+			Loc:       Location{File: p, Line: 0, Col: 0},
 		})
 	}
 }

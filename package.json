@@ -184,11 +184,13 @@
       },
       {
         "command": "goravel.artisan.migrate",
-        "title": "Goravel: Artisan migrate"
+        "title": "Goravel: Artisan migrate",
+        "icon": "$(play)"
       },
       {
         "command": "goravel.artisan.migrateRollback",
-        "title": "Goravel: Artisan migrate:rollback"
+        "title": "Goravel: Artisan migrate:rollback",
+        "icon": "$(discard)"
       },
       {
         "command": "goravel.artisan.seedSpecific",
@@ -246,6 +248,16 @@
           "command": "goravel.registerBootstrap",
           "when": "view == goravel.views.commands && viewItem == goravelUnregistered",
           "group": "inline@1"
+        },
+        {
+          "command": "goravel.artisan.migrate",
+          "when": "view == goravel.views.migrations && viewItem =~ /^goravelMigration(Pending)?$/",
+          "group": "inline@1"
+        },
+        {
+          "command": "goravel.artisan.migrateRollback",
+          "when": "view == goravel.views.migrations && viewItem =~ /^goravelMigration(Applied)?$/",
+          "group": "inline@2"
         }
       ],
       "explorer/context": [

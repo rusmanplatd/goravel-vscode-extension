@@ -53,7 +53,8 @@ async function refreshOverview() {
       data.schedules || [],
       data.unregistered || [],
       data.events || [],
-      data.jobs || []
+      data.jobs || [],
+      data.observers || []
     );
     if (statusBar) {
       const nt = currentTables.length;
@@ -77,13 +78,16 @@ async function start(ctx: vscode.ExtensionContext) {
   }
   const serverOptions: ServerOptions = { command, args: [] };
   const clientOptions: LanguageClientOptions = {
-    documentSelector: [{ scheme: "file", language: "go" }],
+    documentSelector: [
+      { scheme: "file", language: "go" },
+      { scheme: "file", pattern: "**/resources/views/**/*.{tmpl,html,gohtml}" },
+    ],
     initializationOptions: {
       liveIntrospection: cfg.get<boolean>("sql.liveIntrospection", false),
     },
     synchronize: {
       fileEvents: vscode.workspace.createFileSystemWatcher(
-        "**/{app/models,app/rules,app/console,app/events,app/listeners,app/jobs,app/providers,app/http/controllers,app/http/requests,app/http/middleware,bootstrap,config,routes,database/migrations*,database/seeders,resources/views,lang}/**/*"
+        "**/{app/models,app/rules,app/console,app/events,app/listeners,app/jobs,app/observers,app/providers,app/grpc,app/http/controllers,app/http/requests,app/http/middleware,bootstrap,config,routes,database/migrations*,database/seeders,resources/views,lang,proto}/**/*"
       ),
     },
   };
@@ -460,6 +464,7 @@ function renderRouteMatrixHtml(routes: RouteInfo[]): string {
       <option value="PUT">PUT</option>
       <option value="PATCH">PATCH</option>
       <option value="DELETE">DELETE</option>
+      <option value="gRPC">gRPC</option>
     </select>
   </div>
   <table>

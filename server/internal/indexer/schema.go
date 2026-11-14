@@ -248,10 +248,13 @@ type RuleItem struct {
 
 // MigrationItem describes a migration file in database/migrations*.
 type MigrationItem struct {
-	Name   string   `json:"name"`
-	Folder string   `json:"folder"`
-	Table  string   `json:"table"`
-	Loc    Location `json:"loc"`
+	Name      string   `json:"name"`
+	Signature string   `json:"signature,omitempty"`
+	Folder    string   `json:"folder"`
+	Table     string   `json:"table"`
+	Status    string   `json:"status,omitempty"` // "applied" | "pending" | ""
+	Batch     int      `json:"batch,omitempty"`
+	Loc       Location `json:"loc"`
 }
 
 // SeederItem describes a database seeder in database/seeders.
@@ -307,6 +310,38 @@ type JobItem struct {
 	Loc       Location `json:"loc"`
 }
 
+// ObserverItem describes a Model Observer in app/observers and its lifecycle hooks.
+type ObserverItem struct {
+	Name  string   `json:"name"`
+	Model string   `json:"model"`
+	Hooks []string `json:"hooks,omitempty"`
+	Loc   Location `json:"loc"`
+}
+
+// ScopeItem describes a reusable ORM Query Scope function in app/models.
+type ScopeItem struct {
+	Name  string   `json:"name"`
+	Model string   `json:"model,omitempty"`
+	Loc   Location `json:"loc"`
+}
+
+// ViewVar describes a template variable passed via ctx.Response().View().Make("view", map[string]any{...}).
+type ViewVar struct {
+	Key        string   `json:"key"`
+	ValueExpr  string   `json:"valueExpr"`
+	Controller string   `json:"controller,omitempty"`
+	Loc        Location `json:"loc"`
+}
+
+// ProtoMethod describes an RPC method defined in a .proto file.
+type ProtoMethod struct {
+	Service string   `json:"service"`
+	Method  string   `json:"method"`
+	ReqType string   `json:"reqType,omitempty"`
+	ResType string   `json:"resType,omitempty"`
+	Loc     Location `json:"loc"`
+}
+
 // TableConstInfo describes an *OriginalTableName constant in app/models.
 type TableConstInfo struct {
 	Name      string   `json:"name"`
@@ -327,29 +362,33 @@ type DBFunction struct {
 type Catalog struct {
 	mu                 sync.RWMutex
 	Root               string
-	Tables             map[string]*Table                         // by table name (no schema)
-	Models             map[string]*Table                         // by Go model name
-	TableConsts        map[string]*TableConstInfo                // by constant identifier name
-	DBFunctions        []*DBFunction                             // live DB functions & procedures
-	Structs            map[string]*StructInfo                    // all structs in app/models and app/http/requests
-	Configs            map[string]*ConfigItem                    // by dot key (e.g. "jwt.secret")
-	EnvVars            map[string]string                         // by env var name from .env*
-	Routes             []*RouteItem                              // all registered routes
-	Rules              map[string]*RuleItem                      // by rule signature
-	Migrations         []*MigrationItem                          // all migration files
-	Commands           []*CommandItem                            // custom Artisan commands
-	Controllers        map[string]map[string]Location            // Controller -> Method -> Location
-	Views              map[string]Location                       // relative view path (e.g. "auth/signin.tmpl") -> Location
-	Middleware         map[string]Location                       // middleware name -> Location
-	Seeders            []*SeederItem                             // database seeders
-	Schedules          []*ScheduleItem                           // scheduled tasks
-	Translations       map[string]map[string]TranslationEntry    // key -> locale -> TranslationEntry
-	Gates              map[string]*GateItem                      // ability -> GateItem
-	Events             []*EventItem                              // indexed events and their listeners
-	Listeners          map[string]Location                       // ListenerStruct -> Location
-	Jobs               []*JobItem                                // indexed queue jobs
-	Unregistered       []*UnregisteredItem                       // items not wired in bootstrap/
-	UnregisteredByFile map[string]*UnregisteredItem              // file path -> unregistered item
+	Tables             map[string]*Table                      // by table name (no schema)
+	Models             map[string]*Table                      // by Go model name
+	TableConsts        map[string]*TableConstInfo             // by constant identifier name
+	DBFunctions        []*DBFunction                          // live DB functions & procedures
+	Structs            map[string]*StructInfo                 // all structs in app/models and app/http/requests
+	Configs            map[string]*ConfigItem                 // by dot key (e.g. "jwt.secret")
+	EnvVars            map[string]string                      // by env var name from .env*
+	Routes             []*RouteItem                           // all registered HTTP & gRPC routes
+	Rules              map[string]*RuleItem                   // by rule signature
+	Migrations         []*MigrationItem                       // all migration files
+	Commands           []*CommandItem                         // custom Artisan commands
+	Controllers        map[string]map[string]Location         // Controller -> Method -> Location
+	Views              map[string]Location                    // relative view path (e.g. "auth/signin.tmpl") -> Location
+	ViewVars           map[string][]ViewVar                   // view name -> passed template variables
+	Middleware         map[string]Location                    // middleware name -> Location
+	Seeders            []*SeederItem                          // database seeders
+	Schedules          []*ScheduleItem                        // scheduled tasks
+	Translations       map[string]map[string]TranslationEntry // key -> locale -> TranslationEntry
+	Gates              map[string]*GateItem                   // ability -> GateItem
+	Events             []*EventItem                           // indexed events and their listeners
+	Listeners          map[string]Location                    // ListenerStruct -> Location
+	Jobs               []*JobItem                             // indexed queue jobs
+	Observers          []*ObserverItem                        // indexed model observers
+	Scopes             []*ScopeItem                           // indexed model query scopes
+	ProtoMethods       map[string]map[string]ProtoMethod      // Service -> Method -> ProtoMethod
+	Unregistered       []*UnregisteredItem                    // items not wired in bootstrap/
+	UnregisteredByFile map[string]*UnregisteredItem           // file path -> unregistered item
 }
 
 func NewCatalog() *Catalog {
@@ -363,10 +402,12 @@ func NewCatalog() *Catalog {
 		Rules:              map[string]*RuleItem{},
 		Controllers:        map[string]map[string]Location{},
 		Views:              map[string]Location{},
+		ViewVars:           map[string][]ViewVar{},
 		Middleware:         map[string]Location{},
 		Translations:       map[string]map[string]TranslationEntry{},
 		Gates:              map[string]*GateItem{},
 		Listeners:          map[string]Location{},
+		ProtoMethods:       map[string]map[string]ProtoMethod{},
 		UnregisteredByFile: map[string]*UnregisteredItem{},
 	}
 	seedBuiltinRules(c)
@@ -503,6 +544,7 @@ func Build(root string) *Catalog {
 	resolveModelRelations(c)
 	indexConfigs(c, root)
 	indexRoutes(c, root)
+	indexGrpcRoutes(c, root)
 	indexRules(c, root)
 	indexRequests(c, root)
 	indexCommands(c, root)
@@ -513,6 +555,7 @@ func Build(root string) *Catalog {
 	indexTranslations(c, root)
 	indexGates(c, root)
 	indexEventsAndJobs(c, root)
+	indexObserversAndScopes(c, root)
 	indexBootstrapRegistrations(c, root)
 	indexLiveDBIfEnabled(c, root)
 	return c

@@ -50,8 +50,11 @@ export interface RouteInfo {
 
 export interface MigrationInfo {
   name: string;
+  signature?: string;
   folder: string;
   table: string;
+  status?: string;
+  batch?: number;
   loc: Loc;
 }
 
@@ -96,6 +99,13 @@ export interface JobInfo {
   loc: Loc;
 }
 
+export interface ObserverInfo {
+  name: string;
+  model: string;
+  hooks?: string[];
+  loc: Loc;
+}
+
 export interface OverviewData {
   tables: TableInfo[];
   routes: RouteInfo[];
@@ -105,6 +115,7 @@ export interface OverviewData {
   schedules?: ScheduleInfo[];
   events?: EventInfo[];
   jobs?: JobInfo[];
+  observers?: ObserverInfo[];
   unregistered?: UnregisteredInfo[];
 }
 
@@ -208,7 +219,7 @@ export class RoutesTreeProvider implements vscode.TreeDataProvider<RouteNode> {
     const r = el.route;
     const item = new vscode.TreeItem(`${r.method} ${r.path}`, vscode.TreeItemCollapsibleState.None);
     item.description = r.handler;
-    item.iconPath = new vscode.ThemeIcon("globe");
+    item.iconPath = new vscode.ThemeIcon(r.method === "gRPC" ? "symbol-interface" : "globe");
     item.contextValue = "goravelRoute";
     item.command = openCmd(r.ctrlLoc?.file ? r.ctrlLoc : r.loc);
     return item;
@@ -258,8 +269,21 @@ export class MigrationsTreeProvider implements vscode.TreeDataProvider<Migration
     }
     const m = el.item;
     const item = new vscode.TreeItem(m.name, vscode.TreeItemCollapsibleState.None);
-    item.description = m.table ? `→ ${m.table}` : "";
-    item.iconPath = new vscode.ThemeIcon("file-code");
+    const parts: string[] = [];
+    if (m.table) parts.push(`→ ${m.table}`);
+    if (m.status === "applied") {
+      parts.push(`Applied (batch ${m.batch || 1})`);
+      item.iconPath = new vscode.ThemeIcon("pass", new vscode.ThemeColor("testing.iconPassed"));
+      item.contextValue = "goravelMigrationApplied";
+    } else if (m.status === "pending") {
+      parts.push("Pending");
+      item.iconPath = new vscode.ThemeIcon("clock", new vscode.ThemeColor("editorWarning.foreground"));
+      item.contextValue = "goravelMigrationPending";
+    } else {
+      item.iconPath = new vscode.ThemeIcon("file-code");
+      item.contextValue = "goravelMigration";
+    }
+    item.description = parts.join(" · ");
     item.command = openCmd(m.loc);
     return item;
   }
@@ -292,6 +316,7 @@ type CommandNode =
   | { kind: "schedule"; schedule: ScheduleInfo }
   | { kind: "event"; event: EventInfo }
   | { kind: "job"; job: JobInfo }
+  | { kind: "observer"; observer: ObserverInfo }
   | { kind: "unregistered"; item: UnregisteredInfo };
 
 export class CommandsTreeProvider implements vscode.TreeDataProvider<CommandNode> {
@@ -302,6 +327,7 @@ export class CommandsTreeProvider implements vscode.TreeDataProvider<CommandNode
   private schedules: ScheduleInfo[] = [];
   private events: EventInfo[] = [];
   private jobs: JobInfo[] = [];
+  private observers: ObserverInfo[] = [];
   private unregistered: UnregisteredInfo[] = [];
 
   setData(
@@ -310,7 +336,8 @@ export class CommandsTreeProvider implements vscode.TreeDataProvider<CommandNode
     schedules: ScheduleInfo[],
     unregistered: UnregisteredInfo[],
     events: EventInfo[] = [],
-    jobs: JobInfo[] = []
+    jobs: JobInfo[] = [],
+    observers: ObserverInfo[] = []
   ) {
     this.commands = commands || [];
     this.seeders = seeders || [];
@@ -318,6 +345,7 @@ export class CommandsTreeProvider implements vscode.TreeDataProvider<CommandNode
     this.unregistered = unregistered || [];
     this.events = events || [];
     this.jobs = jobs || [];
+    this.observers = observers || [];
     this._onDidChangeTreeData.fire();
   }
 
@@ -334,6 +362,7 @@ export class CommandsTreeProvider implements vscode.TreeDataProvider<CommandNode
         schedules: "clock",
         events: "broadcast",
         jobs: "layers",
+        observers: "eye",
         unregistered: "warning",
       };
       item.iconPath = new vscode.ThemeIcon(iconMap[el.id] || "folder");
@@ -391,6 +420,15 @@ export class CommandsTreeProvider implements vscode.TreeDataProvider<CommandNode
       item.command = openCmd(jb.loc);
       return item;
     }
+    if (el.kind === "observer") {
+      const obs = el.observer;
+      const item = new vscode.TreeItem(obs.name, vscode.TreeItemCollapsibleState.None);
+      const hooks = obs.hooks?.length ? ` (${obs.hooks.join(", ")})` : "";
+      item.description = `${obs.model ? `→ models.${obs.model}` : ""}${hooks}`;
+      item.iconPath = new vscode.ThemeIcon("eye");
+      item.command = openCmd(obs.loc);
+      return item;
+    }
     const u = el.item;
     const item = new vscode.TreeItem(u.name, vscode.TreeItemCollapsibleState.None);
     item.description = `${u.kind} (not in bootstrap/)`;
@@ -413,6 +451,9 @@ export class CommandsTreeProvider implements vscode.TreeDataProvider<CommandNode
       if (this.jobs.length > 0) {
         sections.push({ kind: "section", id: "jobs", label: "Queue Jobs", count: this.jobs.length });
       }
+      if (this.observers.length > 0) {
+        sections.push({ kind: "section", id: "observers", label: "Model Observers", count: this.observers.length });
+      }
       if (this.unregistered.length > 0) {
         sections.push({ kind: "section", id: "unregistered", label: "Unregistered in bootstrap/", count: this.unregistered.length });
       }
@@ -424,6 +465,7 @@ export class CommandsTreeProvider implements vscode.TreeDataProvider<CommandNode
       if (el.id === "schedules") return this.schedules.map((schedule) => ({ kind: "schedule", schedule }));
       if (el.id === "events") return this.events.map((event) => ({ kind: "event", event }));
       if (el.id === "jobs") return this.jobs.map((job) => ({ kind: "job", job }));
+      if (el.id === "observers") return this.observers.map((observer) => ({ kind: "observer", observer }));
       if (el.id === "unregistered") return this.unregistered.map((item) => ({ kind: "unregistered", item }));
     }
     return [];

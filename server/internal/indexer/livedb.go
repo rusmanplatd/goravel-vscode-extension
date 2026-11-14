@@ -162,6 +162,12 @@ func introspectLiveDBWithConfig(c *Catalog, cfg dbConnConfig) {
 		if out, err := rcmd.Output(); err == nil {
 			parseDelimitedRoutines(c, string(out), "|")
 		}
+		mq := `SELECT migration, batch FROM migrations`
+		mcmd := exec.CommandContext(ctx, "psql", "-h", cfg.Host, "-p", port, "-U", cfg.Username, "-d", cfg.Database, "-At", "-F", "|", "-c", mq)
+		mcmd.Env = append(os.Environ(), "PGPASSWORD="+cfg.Password)
+		if out, err := mcmd.Output(); err == nil {
+			parseDelimitedMigrations(c, string(out), "|")
+		}
 
 	case isMySQL(cfg.Driver):
 		port := cfg.Port
@@ -178,11 +184,20 @@ func introspectLiveDBWithConfig(c *Catalog, cfg dbConnConfig) {
 		if out, err := exec.CommandContext(ctx, "mysql", rargs...).Output(); err == nil {
 			parseDelimitedRoutines(c, string(out), "\t")
 		}
+		mq := `SELECT migration, batch FROM migrations`
+		margs := mysqlArgs(cfg, port, "-N", "-B", "-e", mq)
+		if out, err := exec.CommandContext(ctx, "mysql", margs...).Output(); err == nil {
+			parseDelimitedMigrations(c, string(out), "\t")
+		}
 
 	case isSQLite(cfg.Driver):
 		q := `SELECT m.name || '|' || p.name || '|' || COALESCE(p.type, '') || '|' || CASE WHEN p."notnull" = 0 THEN 'YES' ELSE 'NO' END FROM sqlite_master m JOIN pragma_table_info(m.name) p WHERE m.type IN ('table','view') AND m.name NOT LIKE 'sqlite_%'`
 		if out, err := exec.CommandContext(ctx, "sqlite3", cfg.Database, q).Output(); err == nil {
 			parseDelimitedColumns(c, string(out), "|")
+		}
+		mq := `SELECT migration || '|' || batch FROM migrations`
+		if out, err := exec.CommandContext(ctx, "sqlite3", cfg.Database, mq).Output(); err == nil {
+			parseDelimitedMigrations(c, string(out), "|")
 		}
 
 	case isSQLServer(cfg.Driver):
@@ -199,6 +214,11 @@ func introspectLiveDBWithConfig(c *Catalog, cfg dbConnConfig) {
 		rcmd := exec.CommandContext(ctx, "sqlcmd", "-S", server, "-U", cfg.Username, "-P", cfg.Password, "-d", cfg.Database, "-h", "-1", "-W", "-s", "|", "-Q", rq)
 		if out, err := rcmd.Output(); err == nil {
 			parseDelimitedRoutines(c, string(out), "|")
+		}
+		mq := `SET NOCOUNT ON; SELECT migration, batch FROM migrations`
+		mcmd := exec.CommandContext(ctx, "sqlcmd", "-S", server, "-U", cfg.Username, "-P", cfg.Password, "-d", cfg.Database, "-h", "-1", "-W", "-s", "|", "-Q", mq)
+		if out, err := mcmd.Output(); err == nil {
+			parseDelimitedMigrations(c, string(out), "|")
 		}
 	}
 }
@@ -254,6 +274,45 @@ func parseDelimitedRoutines(c *Catalog, out, sep string) {
 			Kind:       strings.ToUpper(strings.TrimSpace(parts[2])),
 			ReturnType: strings.ToUpper(ret),
 		})
+	}
+}
+
+func parseDelimitedMigrations(c *Catalog, out, sep string) {
+	applied := map[string]int{}
+	for _, line := range strings.Split(out, "\n") {
+		parts := strings.Split(strings.TrimSpace(line), sep)
+		if len(parts) < 2 {
+			continue
+		}
+		mig := strings.TrimSpace(parts[0])
+		if mig == "" || strings.HasPrefix(mig, "---") {
+			continue
+		}
+		batch, err := strconv.Atoi(strings.TrimSpace(parts[1]))
+		if err != nil || batch <= 0 {
+			batch = 1
+		}
+		applied[mig] = batch
+	}
+	ApplyLiveMigrationStatus(c, applied)
+}
+
+// ApplyLiveMigrationStatus marks catalog migrations as "applied" (with batch number) or "pending".
+func ApplyLiveMigrationStatus(c *Catalog, applied map[string]int) {
+	if c == nil {
+		return
+	}
+	for _, m := range c.Migrations {
+		if b, ok := applied[m.Signature]; ok && b > 0 {
+			m.Status = "applied"
+			m.Batch = b
+		} else if b, ok := applied[m.Name]; ok && b > 0 {
+			m.Status = "applied"
+			m.Batch = b
+		} else {
+			m.Status = "pending"
+			m.Batch = 0
+		}
 	}
 }
 

@@ -3,7 +3,11 @@ package indexer
 import (
 	"go/ast"
 	"go/token"
+	"io/fs"
+	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -351,4 +355,214 @@ func joinPath(a, b string) string {
 	}
 	return res
 }
+
+var (
+	protoServiceRe = regexp.MustCompile(`(?s)\bservice\s+(\w+)\s*\{([^}]*)\}`)
+	protoRpcRe     = regexp.MustCompile(`\brpc\s+(\w+)\s*\(\s*(?:stream\s+)?([\w.]+)\s*\)\s*returns\s*\(\s*(?:stream\s+)?([\w.]+)\s*\)`)
+)
+
+func indexGrpcRoutes(c *Catalog, root string) {
+	// 1. Parse .proto files in proto/, app/grpc/, contracts/proto/
+	for _, sub := range []string{"proto", filepath.Join("app", "grpc"), filepath.Join("contracts", "proto")} {
+		dir := filepath.Join(root, sub)
+		if _, err := os.Stat(dir); err != nil {
+			continue
+		}
+		_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || d.IsDir() || !strings.HasSuffix(strings.ToLower(d.Name()), ".proto") {
+				return nil
+			}
+			b, err := os.ReadFile(p)
+			if err != nil {
+				return nil
+			}
+			src := string(b)
+			for _, sm := range protoServiceRe.FindAllStringSubmatchIndex(src, -1) {
+				svc := src[sm[2]:sm[3]]
+				body := src[sm[4]:sm[5]]
+				bodyOff := sm[4]
+				if c.ProtoMethods[svc] == nil {
+					c.ProtoMethods[svc] = map[string]ProtoMethod{}
+				}
+				for _, rm := range protoRpcRe.FindAllStringSubmatchIndex(body, -1) {
+					mName := body[rm[2]:rm[3]]
+					reqT := body[rm[4]:rm[5]]
+					resT := body[rm[6]:rm[7]]
+					c.ProtoMethods[svc][mName] = ProtoMethod{
+						Service: svc,
+						Method:  mName,
+						ReqType: reqT,
+						ResType: resT,
+						Loc:     offsetLoc(p, src, bodyOff+rm[2]),
+					}
+				}
+			}
+			return nil
+		})
+	}
+
+	// 2. Index gRPC controller methods in app/grpc/controllers
+	grpcCtrlMethods := map[string][]string{}
+	grpcCtrlFiles := walkGoFiles(filepath.Join(root, "app", "grpc", "controllers"))
+	for _, pf := range grpcCtrlFiles {
+		for _, d := range pf.file.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Recv == nil || fd.Name == nil || !fd.Name.IsExported() {
+				continue
+			}
+			ctrl := recvName(fd.Recv)
+			if ctrl == "" {
+				continue
+			}
+			if c.Controllers[ctrl] == nil {
+				c.Controllers[ctrl] = map[string]Location{}
+			}
+			c.Controllers[ctrl][fd.Name.Name] = loc(pf, fd.Name.Pos())
+			grpcCtrlMethods[ctrl] = append(grpcCtrlMethods[ctrl], fd.Name.Name)
+		}
+	}
+
+	// 3. Scan routes/ (e.g. routes/grpc.go) and app/providers/ for Register<Service>Server(..., <ctrl>)
+	var routeFiles []*parsedFile
+	routeFiles = append(routeFiles, walkGoFiles(filepath.Join(root, "routes"))...)
+	routeFiles = append(routeFiles, walkGoFiles(filepath.Join(root, "app", "providers"))...)
+	registeredCtrl := map[string]bool{}
+	for _, pf := range routeFiles {
+		for _, d := range pf.file.Decls {
+			fd, ok := d.(*ast.FuncDecl)
+			if !ok || fd.Body == nil {
+				continue
+			}
+			ctrlVars := map[string]string{}
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				as, ok := n.(*ast.AssignStmt)
+				if !ok || len(as.Lhs) != 1 || len(as.Rhs) != 1 {
+					return true
+				}
+				id, ok := as.Lhs[0].(*ast.Ident)
+				if !ok {
+					return true
+				}
+				if ctrl := extractControllerType(as.Rhs[0]); ctrl != "" {
+					ctrlVars[id.Name] = ctrl
+				}
+				return true
+			})
+			ast.Inspect(fd.Body, func(n ast.Node) bool {
+				call, ok := n.(*ast.CallExpr)
+				if !ok || len(call.Args) < 2 {
+					return true
+				}
+				fnName := ""
+				var fnPos token.Pos
+				switch f := call.Fun.(type) {
+				case *ast.Ident:
+					fnName = f.Name
+					fnPos = f.Pos()
+				case *ast.SelectorExpr:
+					fnName = f.Sel.Name
+					fnPos = f.Sel.Pos()
+				}
+				if !strings.HasPrefix(fnName, "Register") || !strings.HasSuffix(fnName, "Server") {
+					return true
+				}
+				svcName := strings.TrimSuffix(strings.TrimPrefix(fnName, "Register"), "Server")
+				if svcName == "" {
+					return true
+				}
+				ctrlArg := call.Args[len(call.Args)-1]
+				ctrl := ""
+				if id, ok := ctrlArg.(*ast.Ident); ok {
+					ctrl = ctrlVars[id.Name]
+				} else {
+					ctrl = extractControllerType(ctrlArg)
+				}
+				if ctrl == "" {
+					return true
+				}
+				registeredCtrl[ctrl] = true
+				methods := collectGrpcServiceMethods(c, svcName, ctrl, grpcCtrlMethods[ctrl])
+				regLoc := loc(pf, fnPos)
+				for _, mName := range methods {
+					var ctrlLoc Location
+					if m, ok := c.Controllers[ctrl]; ok {
+						ctrlLoc = m[mName]
+					}
+					routeLoc := regLoc
+					if pm, ok := c.ProtoMethods[svcName][mName]; ok && pm.Loc.Valid() && !routeLoc.Valid() {
+						routeLoc = pm.Loc
+					}
+					c.Routes = append(c.Routes, &RouteItem{
+						Method:     "gRPC",
+						Path:       "/" + svcName + "/" + mName,
+						Handler:    ctrl + "." + mName,
+						Controller: ctrl,
+						Action:     mName,
+						Module:     "grpc",
+						Loc:        routeLoc,
+						CtrlLoc:    ctrlLoc,
+					})
+				}
+				return true
+			})
+		}
+	}
+
+	// 4. Also link any app/grpc/controllers not explicitly caught via Register*Server if they match a Proto service
+	for ctrl, methods := range grpcCtrlMethods {
+		if registeredCtrl[ctrl] {
+			continue
+		}
+		stem := strings.TrimSuffix(ctrl, "Controller")
+		svcName := stem + "Service"
+		if _, ok := c.ProtoMethods[svcName]; !ok {
+			if _, ok2 := c.ProtoMethods[stem]; ok2 {
+				svcName = stem
+			}
+		}
+		for _, mName := range methods {
+			ctrlLoc := c.Controllers[ctrl][mName]
+			routeLoc := ctrlLoc
+			if pm, ok := c.ProtoMethods[svcName][mName]; ok && pm.Loc.Valid() {
+				routeLoc = pm.Loc
+			}
+			c.Routes = append(c.Routes, &RouteItem{
+				Method:     "gRPC",
+				Path:       "/" + svcName + "/" + mName,
+				Handler:    ctrl + "." + mName,
+				Controller: ctrl,
+				Action:     mName,
+				Module:     "grpc",
+				Loc:        routeLoc,
+				CtrlLoc:    ctrlLoc,
+			})
+		}
+	}
+}
+
+func collectGrpcServiceMethods(c *Catalog, svcName, ctrl string, ctrlMethods []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range ctrlMethods {
+		if !seen[m] {
+			seen[m] = true
+			out = append(out, m)
+		}
+	}
+	if pmMap, ok := c.ProtoMethods[svcName]; ok {
+		var protoNames []string
+		for m := range pmMap {
+			protoNames = append(protoNames, m)
+		}
+		sort.Strings(protoNames)
+		for _, m := range protoNames {
+			if !seen[m] {
+				seen[m] = true
+				out = append(out, m)
+			}
+		}
+	}
+	return out
+}
+
 

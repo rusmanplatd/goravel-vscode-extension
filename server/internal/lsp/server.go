@@ -289,13 +289,16 @@ func shouldReindex(path string) bool {
 		strings.Contains(path, "/app/http/controllers/") ||
 		strings.Contains(path, "/app/http/requests/") ||
 		strings.Contains(path, "/app/http/middleware/") ||
+		strings.Contains(path, "/app/grpc/") ||
 		strings.Contains(path, "/app/events/") ||
 		strings.Contains(path, "/app/listeners/") ||
 		strings.Contains(path, "/app/jobs/") ||
+		strings.Contains(path, "/app/observers/") ||
 		strings.Contains(path, "/app/providers/") ||
 		strings.Contains(path, "/bootstrap/") ||
 		strings.Contains(path, "/resources/views/") ||
 		strings.Contains(path, "/lang/") ||
+		strings.HasSuffix(path, ".proto") ||
 		strings.HasSuffix(path, "/.env") ||
 		strings.HasSuffix(path, "/.env.example")
 }
@@ -317,10 +320,10 @@ func (s *Server) resolveInput(raw json.RawMessage) (uri, path, text string, p po
 	_ = json.Unmarshal(raw, &p)
 	uri = p.TextDocument.URI
 	text, found := s.docs[uri]
-	if !found || !strings.HasSuffix(uri, ".go") {
+	path = uriToPath(uri)
+	if !found || (!strings.HasSuffix(uri, ".go") && !framework.IsTemplateFile(path)) {
 		return
 	}
-	path = uriToPath(uri)
 	off = posToOffset(text, p.Position)
 	ok = true
 	return
@@ -329,7 +332,8 @@ func (s *Server) resolveInput(raw json.RawMessage) (uri, path, text string, p po
 // resolve finds file, doc, scope and virtual offset for a raw SQL request.
 func (s *Server) resolve(raw json.RawMessage) (text string, p posParams, off int, fi *rawsql.FileInfo, d *rawsql.Doc, v int, sc rawsql.Scope, ok bool) {
 	_, path, text, p, off, ok := s.resolveInput(raw)
-	if !ok {
+	if !ok || !strings.HasSuffix(path, ".go") {
+		ok = false
 		return
 	}
 	fi = rawsql.Extract(path, []byte(text), s.cat)
@@ -352,6 +356,16 @@ func (s *Server) resolve(raw json.RawMessage) (text string, p posParams, off int
 func (s *Server) completion(raw json.RawMessage) any {
 	_, path, text, _, off, inputOK := s.resolveInput(raw)
 	if !inputOK {
+		return nil
+	}
+	if framework.IsTemplateFile(path) {
+		if tItems := framework.TemplateCompletions(path, text, s.cat, off); len(tItems) > 0 {
+			var lspItems []map[string]any
+			for _, it := range tItems {
+				lspItems = append(lspItems, map[string]any{"label": it.Label, "detail": it.Detail, "kind": it.Kind})
+			}
+			return map[string]any{"isIncomplete": false, "items": lspItems}
+		}
 		return nil
 	}
 	// 1. Check ORM / Config / Validation spans first
@@ -570,6 +584,12 @@ func (s *Server) hover(raw json.RawMessage) any {
 	if !inputOK {
 		return nil
 	}
+	if framework.IsTemplateFile(path) {
+		if h := framework.TemplateHover(path, text, s.cat, off); h != nil {
+			return map[string]any{"contents": map[string]any{"kind": "markdown", "value": h.Markdown}}
+		}
+		return nil
+	}
 	// 1. Check ORM / Config / Validation spans first
 	fa := orm.AnalyzeFile(path, []byte(text), s.cat)
 	if md, st, en, ok := fa.Hover(off, s.cat); ok {
@@ -662,6 +682,15 @@ func (s *Server) definition(raw json.RawMessage) any {
 		if l.Valid() {
 			locs = append(locs, LocationT{pathToURI(l.File), Range{Position{l.Line, l.Col}, Position{l.Line, l.Col + n}}})
 		}
+	}
+	if framework.IsTemplateFile(path) {
+		for _, l := range framework.TemplateDefinition(path, text, s.cat, off) {
+			add(l, 0)
+		}
+		if len(locs) > 0 {
+			return locs
+		}
+		return nil
 	}
 
 	// 1. Check ORM / Config / Validation spans first
@@ -945,6 +974,57 @@ func (s *Server) codeLens(raw json.RawMessage) any {
 			},
 		})
 	}
+	for _, obs := range s.cat.Observers {
+		if obs.Model == "" {
+			continue
+		}
+		t := s.cat.Model(obs.Model)
+		if t == nil || !t.Loc.Valid() || filepath.Clean(t.Loc.File) != path {
+			continue
+		}
+		pos := Position{t.Loc.Line, t.Loc.Col}
+		hookSuffix := ""
+		if len(obs.Hooks) > 0 {
+			hookSuffix = " (" + strings.Join(obs.Hooks, ", ") + ")"
+		}
+		lenses = append(lenses, map[string]any{
+			"range": Range{pos, pos},
+			"command": map[string]any{
+				"title":     fmt.Sprintf("$(eye) Observer: %s%s", obs.Name, hookSuffix),
+				"command":   "goravel.openLocation",
+				"arguments": []any{obs.Loc.File, obs.Loc.Line, obs.Loc.Col},
+			},
+		})
+	}
+	if strings.Contains(filepath.ToSlash(path), "/app/models/") {
+		scopesByModel := map[string][]string{}
+		firstLocByModel := map[string]indexer.Location{}
+		for _, sc := range s.cat.Scopes {
+			if sc.Model == "" {
+				continue
+			}
+			scopesByModel[sc.Model] = append(scopesByModel[sc.Model], sc.Name)
+			if _, ok := firstLocByModel[sc.Model]; !ok {
+				firstLocByModel[sc.Model] = sc.Loc
+			}
+		}
+		for mName, scNames := range scopesByModel {
+			t := s.cat.Model(mName)
+			if t == nil || !t.Loc.Valid() || filepath.Clean(t.Loc.File) != path {
+				continue
+			}
+			pos := Position{t.Loc.Line, t.Loc.Col}
+			fl := firstLocByModel[mName]
+			lenses = append(lenses, map[string]any{
+				"range": Range{pos, pos},
+				"command": map[string]any{
+					"title":     fmt.Sprintf("$(filter) %d Scope(s): %s", len(scNames), strings.Join(scNames, ", ")),
+					"command":   "goravel.openLocation",
+					"arguments": []any{fl.File, fl.Line, fl.Col},
+				},
+			})
+		}
+	}
 	if strings.HasSuffix(path, "_test.go") {
 		if text, ok := s.docs[p.TextDocument.URI]; ok {
 			fset := token.NewFileSet()
@@ -1093,6 +1173,8 @@ func (s *Server) overview() any {
 		"schedules":    s.cat.Schedules,
 		"events":       s.cat.Events,
 		"jobs":         s.cat.Jobs,
+		"observers":    s.cat.Observers,
+		"scopes":       s.cat.Scopes,
 		"unregistered": s.cat.Unregistered,
 	}
 }

@@ -1,6 +1,6 @@
 # Goravel VS Code Extension — Feature Analysis & Implementation Roadmap
 
-This document tracks the analysis of existing capabilities, implemented enhancements (**P0–P3**), and the next-wave backlog (**P4**) for `goravel-vscode-extension`.
+This document tracks the analysis of existing capabilities and implemented enhancements (**P0–P4**) for `goravel-vscode-extension`.
 
 ---
 
@@ -15,10 +15,11 @@ This document tracks the analysis of existing capabilities, implemented enhancem
 
 | Domain | Baseline (`v0.5.0`) | Enhanced (`Current`) |
 |---|---|---|
-| **Schema & Migrations** | `Schema().Create` & raw `CREATE TABLE` indexing; Model ← Migration drift Quick Fix | + Chronological `Schema().Table` (`DropColumn`, `RenameColumn`, add column) & raw `ALTER TABLE` parsing; bidirectional **Model ↔ Migration** cross-file Quick Fixes |
+| **Schema & Migrations** | `Schema().Create` & raw `CREATE TABLE` indexing; Model ← Migration drift Quick Fix | + Chronological `Schema().Table` (`DropColumn`, `RenameColumn`, add column) & raw `ALTER TABLE` parsing; bidirectional **Model ↔ Migration** cross-file Quick Fixes; live DB **Applied (batch N) / Pending** migration badges & inline Migrate/Rollback actions |
 | **Bootstrap Wiring** | Read-only warnings for unregistered items | + One-click **Cross-File Quick Fix** & Sidebar button (`goravel.registerBootstrap`) to auto-register migrations (including `bootstrap/bootstrap_<module>/migrations.go`), seeders, rules, and commands |
-| **ORM Query Builder** | `.Where`, `.Select`, `.Order`, `.Group`, `.Update("col", v)`, `.Pluck`, `.With("Rel")` | + `.Join` / `.LeftJoin` / `.InnerJoin` / `.RightJoin` (table, column & FK `ON` completion + alias resolution), map-based `.Where(map[string]any{...})` & `.Updates(map[string]any{...})`, `.Distinct`, `.WhereColumn`, `.Increment`, `.Decrement`, and nested `.With("Rel", func(q orm.Query) ...)` target-table inference |
-| **Routes & Controllers** | Route indexing, `ctx.Request().Route("param")`, controller CodeLens, `@Router` drift check | + `routes/*.go` **Inlay Hints** & **Hover** (`→ METHOD /full/path [Middlewares]`), `ctx.Request().Input*("...")` & `Query*("...")` completion/hover/definition from bound FormRequest & route params, and Quick Fix to sync `@Router` Swagger comments |
+| **ORM Query Builder & Models** | `.Where`, `.Select`, `.Order`, `.Group`, `.Update("col", v)`, `.Pluck`, `.With("Rel")` | + `.Join` / `.LeftJoin` / `.InnerJoin` / `.RightJoin` (table, column & FK `ON` completion + alias resolution), map-based `.Where(map[string]any{...})` & `.Updates(map[string]any{...})`, `.Distinct`, `.WhereColumn`, `.Increment`, `.Decrement`, nested `.With("Rel", func(q orm.Query) ...)` target-table inference, and **Model Observer & Scope CodeLens** |
+| **Routes, gRPC & Controllers** | Route indexing, `ctx.Request().Route("param")`, controller CodeLens, `@Router` drift check | + `routes/*.go` **Inlay Hints** & **Hover** (`→ METHOD /full/path [Middlewares]`), **gRPC controllers & `.proto` service indexing** (`routes/grpc.go`, `app/grpc/controllers`), `ctx.Request().Input*("...")` & `Query*("...")` completion/hover/definition, and full **Swagger / OpenAPI annotation scaffolding** & `@Router` sync Quick Fixes |
+| **Views & Templates** | `View().Make("...")` template path completion & unused key hint | + Context variable indexing from `View().Make("...", map[string]any{...})` with **completion, hover, and go-to-definition inside `.tmpl` / `.html` / `.gohtml` files** in `resources/views/` |
 | **Config & `.env`** | `facades.Config().Get*` completion, hover, inlay hints, go-to-definition | + Missing `.env` key diagnostics on `config.Env("KEY")` and cross-file Quick Fix to append missing keys to `.env.example` / `.env` |
 | **Localization (`Lang`)** | *Not supported* | + Full `lang/**/*.json` indexing (flat & nested keys), `facades.Lang(ctx).Get("...")` completion, multi-locale Markdown hover, inline preview inlay hints, go-to-definition, references, rename, missing-key diagnostics, and Quick Fix to add keys to `lang/en.json` |
 | **Authorization (`Gate`)** | *Not supported* | + Indexes `facades.Gate().Define("ability", ...)` across `app/` & `bootstrap/`; provides completion, hover, definition, references, rename, and unknown-ability diagnostics on `Allows`, `Denies`, `Inspect`, `Check`, `Any`, `None` |
@@ -111,25 +112,36 @@ This document tracks the analysis of existing capabilities, implemented enhancem
 
 ---
 
-## 3. Future Backlog (P4 — Next Wave Opportunities)
+### P4 — Live Migration Status, Observers/Scopes, Template Intelligence, gRPC & OpenAPI Scaffolding
 
-- [ ] **P4.1: Live Migration Applied/Pending Status in Sidebar**
-  - When `goravel.sql.liveIntrospection` is enabled, query the database `migrations` table and badge each migration in the **Migrations** TreeView as `Applied (batch N)` vs. `Pending`, with inline `Migrate` / `Rollback` buttons.
-- [ ] **P4.2: Model Observers & Scopes Intelligence**
-  - Index `app/observers/` and `facades.Orm().Observe(models.User{}, &observers.UserObserver{})` to display Observer hooks (`Creating`, `Created`, `Updating`, `Deleted`) as CodeLens on Model structs.
-- [ ] **P4.3: Template Variable Completion in `resources/views/`**
-  - Pass controller `ctx.Response().View().Make("view.tmpl", map[string]any{...})` context keys to HTML/template files for variable completion and hover inside `.tmpl` / `.html` views.
-- [ ] **P4.4: gRPC Controllers & Proto Linkage**
-  - Index `app/grpc/controllers` and `routes/grpc.go` alongside HTTP routes in the Routes Explorer and Route Matrix.
-- [ ] **P4.5: Auto-Generate Swagger / OpenAPI Annotations for Controllers**
-  - Code Action on controller methods to scaffold complete `@Summary`, `@Param`, `@Success`, and `@Router` doc comments from the bound `requests.*` struct and registered route metadata.
+- [x] **P4.1: Live Migration Applied/Pending Status in Sidebar**
+  - Extracted migration `Signature()` and queried the live database `migrations` table (PostgreSQL, MySQL, SQLite, SQL Server) when `goravel.sql.liveIntrospection` is enabled (`ApplyLiveMigrationStatus`).
+  - Badged each migration in the **Migrations** TreeView as `Applied (batch N)` vs. `Pending`, with inline `Migrate` (`$(play)`) and `Rollback` (`$(discard)`) buttons.
+  - *Files:* `server/internal/indexer/schema.go`, `server/internal/indexer/migrations.go`, `server/internal/indexer/livedb.go`, `client/src/views/explorers.ts`, `package.json`.
+- [x] **P4.2: Model Observers & Scopes Intelligence**
+  - Indexed `app/observers/` structs, lifecycle hook methods (`Creating`, `Created`, `Updating`, `Updated`, `Saving`, `Saved`, `Deleting`, `Deleted`, `Restoring`, `Restored`, `ForceDeleting`, `ForceDeleted`, `Retrieved`), and `facades.Orm().Observe(models.User{}, &observers.UserObserver{})` registrations.
+  - Indexed reusable ORM query scopes (`func Scope...(q orm.Query) orm.Query`) in `app/models/`.
+  - Added **CodeLens** on Model structs jumping to attached Observers and Query Scopes, plus a **Model Observers** section in the Sidebar and unregistered Observer detection.
+  - *Files:* `server/internal/indexer/schema.go`, `server/internal/indexer/extras.go`, `server/internal/lsp/server.go`, `client/src/views/explorers.ts`.
+- [x] **P4.3: Template Variable Completion in `resources/views/`**
+  - Indexed controller and route `View().Make("view.tmpl", map[string]any{...})` / `View().First(...)` context map keys, value expressions, and locations (`Catalog.ViewVars`).
+  - Enabled LSP `completion`, `hover`, and `definition` inside `.tmpl`, `.html`, and `.gohtml` template files under `resources/views/` when editing inside `{{ ... }}` blocks.
+  - *Files:* `server/internal/indexer/extras.go`, `server/internal/framework/views.go`, `server/internal/lsp/server.go`, `client/src/extension.ts`.
+- [x] **P4.4: gRPC Controllers & Proto Linkage**
+  - Indexed `.proto` services/RPCs (`proto/`, `app/grpc/`, `contracts/proto/`), gRPC controllers (`app/grpc/controllers`), and `Register<Service>Server(...)` calls in `routes/grpc.go` and providers.
+  - Surfaced `gRPC` routes (`/Service/Method`) alongside HTTP routes in the **Routes Explorer**, **Route Matrix** (with `gRPC` method filter), and Controller CodeLens.
+  - *Files:* `server/internal/indexer/routes.go`, `server/internal/indexer/schema.go`, `client/src/views/explorers.ts`, `client/src/extension.ts`.
+- [x] **P4.5: Auto-Generate Swagger / OpenAPI Annotations for Controllers**
+  - Upgraded `ControllerCodeActions` to scaffold complete `@Summary`, `@Tags`, `@Accept json`, `@Produce json`, `@Security BearerAuth` (when auth middleware is attached), path `@Param`, query `@Param` (from `ctx.Request().Query*("...")` and GET `requests.*` structs), body `@Param` (from bound `requests.*` structs), inferred `@Success` response model (`{object} models.X` / `{array} models.X`), and normalized `@Router` annotations.
+  - *Files:* `server/internal/framework/routes_check.go`.
 
 ---
 
-## 4. Verification & Test Suite
+## 3. Verification & Test Suite
 
 - **Go LSP Unit Tests:** `server/internal/lsp/features_test.go` (`npm run test:server`)
   - `TestAlterMigrationAndTranslationsAndGates` — Verifies chronological `Schema().Table` (`RenameColumn`, `DropColumn`, column additions), `lang/*.json` flat/nested indexing, `facades.Gate().Define` indexing, Event → Listener mapping, `ResolveBootstrapRegistrationAction`, and reverse Model → Migration Quick Fix.
   - `TestORMJoinMapWhereWithCallbackAndLangGate` — Verifies `.LeftJoin`, map-based `.Where(map[string]any{...})`, nested `.With("Posts", func(q orm.Query) ...)` callback table inference, missing translation key diagnostics & inlay hints, and unknown Gate ability diagnostics.
   - `TestSanitizeSQLPlaceholdersAndERDiagramAndRename` — Verifies `SanitizeSQLPlaceholders` (`$1`, `?`, `@p1`), `goravel/erDiagram` Mermaid output, and workspace-wide `textDocument/rename`.
+  - `TestP4LiveMigrationsObserversTemplatesGrpcAndSwagger` — Verifies live migration `applied` (with batch number) vs `pending` status (`P4.1`), Observer & Scope indexing + Model CodeLens (`P4.2`), `.tmpl` template variable completion/hover/definition (`P4.3`), gRPC controller & `.proto` route indexing (`P4.4`), and full Swagger/OpenAPI annotation Code Action generation (`P4.5`).
 - **Client Typecheck & Bundle:** `npm run typecheck && npm run build`

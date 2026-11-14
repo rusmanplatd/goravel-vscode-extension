@@ -6,6 +6,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -167,4 +168,150 @@ func ViewDiagnostics(path, src string, cat *indexer.Catalog) []Diag {
 	}
 	return out
 }
+
+// IsTemplateFile reports whether path is an HTML/Go template file.
+func IsTemplateFile(path string) bool {
+	ext := strings.ToLower(filepath.Ext(path))
+	return ext == ".tmpl" || ext == ".html" || ext == ".gohtml"
+}
+
+func resolveViewVarsForTemplate(path string, cat *indexer.Catalog) []indexer.ViewVar {
+	if cat == nil {
+		return nil
+	}
+	slash := filepath.ToSlash(path)
+	var keys []string
+	if idx := strings.Index(slash, "/resources/views/"); idx >= 0 {
+		rel := slash[idx+len("/resources/views/"):]
+		keys = append(keys, rel, strings.TrimSuffix(rel, filepath.Ext(rel)))
+	}
+	base := filepath.Base(slash)
+	keys = append(keys, base, strings.TrimSuffix(base, filepath.Ext(base)))
+	seen := map[string]bool{}
+	var out []indexer.ViewVar
+	for _, k := range keys {
+		for _, vv := range cat.ViewVars[k] {
+			id := vv.Key + "@" + vv.Controller
+			if !seen[id] {
+				seen[id] = true
+				out = append(out, vv)
+			}
+		}
+	}
+	return out
+}
+
+func isInsideTemplateAction(src string, off int) bool {
+	if off < 0 || off > len(src) {
+		return false
+	}
+	openIdx := strings.LastIndex(src[:off], "{{")
+	if openIdx < 0 {
+		return false
+	}
+	closeBefore := strings.LastIndex(src[:off], "}}")
+	return openIdx > closeBefore
+}
+
+// TemplateCompletions suggests context variables passed via View().Make(...) inside {{ ... }} blocks of resources/views/ templates.
+func TemplateCompletions(path, src string, cat *indexer.Catalog, off int) []CompItem {
+	if !IsTemplateFile(path) || !isInsideTemplateAction(src, off) {
+		return nil
+	}
+	vars := resolveViewVarsForTemplate(path, cat)
+	if len(vars) == 0 {
+		return nil
+	}
+	hasDotPrefix := off > 0 && src[off-1] == '.'
+	seen := map[string]bool{}
+	var out []CompItem
+	for _, vv := range vars {
+		if seen[vv.Key] {
+			continue
+		}
+		seen[vv.Key] = true
+		lbl := "." + vv.Key
+		if hasDotPrefix {
+			lbl = vv.Key
+		}
+		detail := vv.ValueExpr
+		if vv.Controller != "" {
+			detail = fmt.Sprintf("%s (from %s)", vv.ValueExpr, vv.Controller)
+		}
+		out = append(out, CompItem{
+			Label:  lbl,
+			Detail: detail,
+			Kind:   6, // Variable
+		})
+	}
+	return out
+}
+
+// TemplateHover displays controller origin and value expression when hovering over a .varName inside a template.
+func TemplateHover(path, src string, cat *indexer.Catalog, off int) *HoverResult {
+	if !IsTemplateFile(path) || !isInsideTemplateAction(src, off) {
+		return nil
+	}
+	word := templateVarAtOffset(src, off)
+	if word == "" {
+		return nil
+	}
+	vars := resolveViewVarsForTemplate(path, cat)
+	var lines []string
+	for _, vv := range vars {
+		if vv.Key == word {
+			srcInfo := vv.ValueExpr
+			if vv.Controller != "" {
+				srcInfo = fmt.Sprintf("`%s` in `%s` (`%s:%d`)", vv.ValueExpr, vv.Controller, filepath.Base(vv.Loc.File), vv.Loc.Line+1)
+			}
+			lines = append(lines, "- Passed as "+srcInfo)
+		}
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+	return &HoverResult{
+		Markdown: fmt.Sprintf("**Template Variable `.%s`**\n\n%s", word, strings.Join(lines, "\n")),
+	}
+}
+
+// TemplateDefinition jumps from .varName in a template file to the View().Make(...) map key in the Go controller.
+func TemplateDefinition(path, src string, cat *indexer.Catalog, off int) []indexer.Location {
+	if !IsTemplateFile(path) || !isInsideTemplateAction(src, off) {
+		return nil
+	}
+	word := templateVarAtOffset(src, off)
+	if word == "" {
+		return nil
+	}
+	vars := resolveViewVarsForTemplate(path, cat)
+	var locs []indexer.Location
+	for _, vv := range vars {
+		if vv.Key == word && vv.Loc.Valid() {
+			locs = append(locs, vv.Loc)
+		}
+	}
+	return locs
+}
+
+func templateVarAtOffset(src string, off int) string {
+	if off < 0 || off > len(src) {
+		return ""
+	}
+	l, r := off, off
+	for l > 0 && isIdentChar(src[l-1]) {
+		l--
+	}
+	for r < len(src) && isIdentChar(src[r]) {
+		r++
+	}
+	if l == r {
+		return ""
+	}
+	if l > 0 && src[l-1] == '.' {
+		return src[l:r]
+	}
+	return src[l:r]
+}
+
 
