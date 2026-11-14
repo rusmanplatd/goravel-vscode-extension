@@ -27,10 +27,10 @@ type RefGeoProvince struct {
 	Code *string `gorm:"type:varchar(50)" json:"code,omitempty"`
 
 	// @Description Timestamp when created
-	CreatedAt time.Time `gorm:"not null;default:now()" json:"created_at"`
+	CreatedAt time.Time `gorm:"not null;default:now()" json:"created_at,omitempty"`
 
 	// @Description Timestamp when last updated
-	UpdatedAt time.Time `gorm:"not null;default:now()" json:"updated_at"`
+	UpdatedAt time.Time `gorm:"not null;default:now()" json:"updated_at,omitempty"`
 
 	// @Description Timestamp when soft deleted
 	DeletedAt *time.Time `gorm:"index" json:"deleted_at,omitempty"`

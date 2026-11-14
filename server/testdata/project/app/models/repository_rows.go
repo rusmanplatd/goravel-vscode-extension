@@ -12,8 +12,8 @@ type ContinentRow struct {
 	ID          uuid.UUID `json:"id"`
 	Name        string    `json:"name"`
 	Code        string    `json:"code"`
-	CreatedAt   time.Time `json:"created_at"`
-	UpdatedAt   time.Time `json:"updated_at"`
+	CreatedAt   time.Time `json:"created_at,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at,omitempty"`
 	CreatedByID uuid.UUID `json:"created_by_id"`
 	UpdatedByID uuid.UUID `json:"updated_by_id"`
 }
@@ -24,8 +24,8 @@ type ProvinceRow struct {
 	CountryID   uuid.UUID      `json:"country_id"`
 	Name        string         `json:"name"`
 	Code        sql.NullString `json:"code"`
-	CreatedAt   time.Time      `json:"created_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
+	CreatedAt   time.Time      `json:"created_at,omitempty"`
+	UpdatedAt   time.Time      `json:"updated_at,omitempty"`
 	CreatedByID uuid.UUID      `json:"created_by_id"`
 	UpdatedByID uuid.UUID      `json:"updated_by_id"`
 	CountryName sql.NullString `json:"country_name"`
@@ -39,8 +39,8 @@ type CityRow struct {
 	Code         sql.NullString  `json:"code"`
 	Latitude     sql.NullFloat64 `json:"latitude"`
 	Longitude    sql.NullFloat64 `json:"longitude"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
+	CreatedAt    time.Time       `json:"created_at,omitempty"`
+	UpdatedAt    time.Time       `json:"updated_at,omitempty"`
 	CreatedByID  uuid.UUID       `json:"created_by_id"`
 	UpdatedByID  uuid.UUID       `json:"updated_by_id"`
 	ProvinceName sql.NullString  `json:"province_name"`
@@ -54,8 +54,8 @@ type CountryRow struct {
 	Name        string         `json:"name"`
 	IsoCode     string         `json:"iso_code"`
 	PhoneCode   sql.NullString `json:"phone_code"`
-	CreatedAt   time.Time      `json:"created_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
+	CreatedAt   time.Time      `json:"created_at,omitempty"`
+	UpdatedAt   time.Time      `json:"updated_at,omitempty"`
 	CreatedByID uuid.UUID      `json:"created_by_id"`
 	UpdatedByID uuid.UUID      `json:"updated_by_id"`
 }
@@ -66,8 +66,8 @@ type DistrictRow struct {
 	CityID       uuid.UUID      `json:"city_id"`
 	Name         string         `json:"name"`
 	Code         sql.NullString `json:"code"`
-	CreatedAt    time.Time      `json:"created_at"`
-	UpdatedAt    time.Time      `json:"updated_at"`
+	CreatedAt    time.Time      `json:"created_at,omitempty"`
+	UpdatedAt    time.Time      `json:"updated_at,omitempty"`
 	CreatedByID  uuid.UUID      `json:"created_by_id"`
 	UpdatedByID  uuid.UUID      `json:"updated_by_id"`
 	CityName     sql.NullString `json:"city_name"`
@@ -82,8 +82,8 @@ type VillageRow struct {
 	Code         sql.NullString  `json:"code"`
 	Latitude     sql.NullFloat64 `json:"latitude"`
 	Longitude    sql.NullFloat64 `json:"longitude"`
-	CreatedAt    time.Time       `json:"created_at"`
-	UpdatedAt    time.Time       `json:"updated_at"`
+	CreatedAt    time.Time       `json:"created_at,omitempty"`
+	UpdatedAt    time.Time       `json:"updated_at,omitempty"`
 	CreatedByID  uuid.UUID       `json:"created_by_id"`
 	UpdatedByID  uuid.UUID       `json:"updated_by_id"`
 	DistrictName sql.NullString  `json:"district_name"`
@@ -100,8 +100,8 @@ type RoleRow struct {
 	OwnerID     uuid.NullUUID  `json:"owner_id"`
 	ScopeType   sql.NullString `json:"scope_type"`
 	ScopeID     uuid.NullUUID  `json:"scope_id"`
-	CreatedAt   time.Time      `json:"created_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
+	CreatedAt   time.Time      `json:"created_at,omitempty"`
+	UpdatedAt   time.Time      `json:"updated_at,omitempty"`
 	CreatedByID uuid.UUID      `json:"created_by_id"`
 	UpdatedByID uuid.UUID      `json:"updated_by_id"`
 }
@@ -132,8 +132,8 @@ type PermissionRow struct {
 	OwnerID     uuid.NullUUID  `json:"owner_id"`
 	ScopeType   sql.NullString `json:"scope_type"`
 	ScopeID     uuid.NullUUID  `json:"scope_id"`
-	CreatedAt   time.Time      `json:"created_at"`
-	UpdatedAt   time.Time      `json:"updated_at"`
+	CreatedAt   time.Time      `json:"created_at,omitempty"`
+	UpdatedAt   time.Time      `json:"updated_at,omitempty"`
 	CreatedByID uuid.UUID      `json:"created_by_id"`
 	UpdatedByID uuid.UUID      `json:"updated_by_id"`
 }
@@ -144,8 +144,8 @@ type UserRow struct {
 	Name            string       `json:"name"`
 	Email           string       `json:"email"`
 	EmailVerifiedAt sql.NullTime `json:"email_verified_at"`
-	CreatedAt       time.Time    `json:"created_at"`
-	UpdatedAt       time.Time    `json:"updated_at"`
+	CreatedAt       time.Time    `json:"created_at,omitempty"`
+	UpdatedAt       time.Time    `json:"updated_at,omitempty"`
 	CreatedByID     uuid.UUID    `json:"created_by_id"`
 	UpdatedByID     uuid.UUID    `json:"updated_by_id"`
 }
@@ -273,9 +273,9 @@ type RefFileRow struct {
 	MimeType       string        `json:"mime_type"`
 	Sha256Checksum string        `json:"sha256_checksum"`
 	Sha512Checksum string        `json:"sha512_checksum"`
-	CreatedAt      time.Time     `json:"created_at"`
+	CreatedAt      time.Time     `json:"created_at,omitempty"`
 	CreatedByID    uuid.NullUUID `json:"created_by_id"`
-	UpdatedAt      time.Time     `json:"updated_at"`
+	UpdatedAt      time.Time     `json:"updated_at,omitempty"`
 	UpdatedByID    uuid.UUID     `json:"updated_by_id"`
 }
 
@@ -288,9 +288,9 @@ type TransHasFileRow struct {
 	ModelID     uuid.UUID     `json:"model_id"`
 	Feature     string        `json:"feature"`
 	Code        string        `json:"code"`
-	CreatedAt   time.Time     `json:"created_at"`
+	CreatedAt   time.Time     `json:"created_at,omitempty"`
 	CreatedByID uuid.UUID     `json:"created_by_id"`
-	UpdatedAt   time.Time     `json:"updated_at"`
+	UpdatedAt   time.Time     `json:"updated_at,omitempty"`
 	UpdatedByID uuid.UUID     `json:"updated_by_id"`
 	DeletedAt   sql.NullTime  `json:"deleted_at"`
 	DeletedByID uuid.NullUUID `json:"deleted_by_id"`
